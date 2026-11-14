@@ -20,7 +20,7 @@ keywords:
   - "Rust"
 preferred-citation:
   type: article
-  title: "AeroFlyway: GPU-Accelerated Continental Avian Migration Simulation, NEXRAD Radar Ingestion, and Bioacoustic Flight-Call Classification"
+  title: "AeroFlyway: Tracking Bird Migration with Weather Radar, Skyglow Maps, and Nighttime Flight Calls"
   authors:
     - family-names: "White"
       given-names: "Bryan P."

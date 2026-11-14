@@ -39,7 +39,7 @@ cargo run --release -- batch --region atlantic --ssp ssp245 --cut-in 3.5,5.0,6.0
 ```bibtex
 @article{White2026AeroFlyway,
   author  = {White, Bryan P.},
-  title   = {AeroFlyway: GPU-Accelerated Continental Avian Migration Simulation, NEXRAD Radar Ingestion, and Bioacoustic Flight-Call Classification},
+  title   = {AeroFlyway: Tracking Bird Migration with Weather Radar, Skyglow Maps, and Nighttime Flight Calls},
   journal = {CRV Science Apps Preprints},
   year    = {2026},
   doi     = {10.5281/zenodo.24222366},
