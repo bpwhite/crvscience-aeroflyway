@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this software or its validation datasets, please cite both the software repository and the accompanying CRV Science Apps monograph."
+type: software
+title: "AeroFlyway: GPU-Accelerated Continental Avian Migration Simulation, NEXRAD Radar Ingestion, and Bioacoustic Flight-Call Classification"
+version: "0.6.0"
+date-released: "2026-11-14"
+doi: "10.5281/zenodo.24222366"
+url: "https://crvscience.com/apps"
+repository-code: "https://github.com/bpwhite/crvscience-aeroflyway"
+license: "MIT"
+authors:
+  - family-names: "White"
+    given-names: "Bryan P."
+    affiliation: "CRV Science Labs"
+keywords:
+  - "avian migration"
+  - "NEXRAD radar"
+  - "bioacoustics"
+  - "light pollution"
+  - "Rust"
+preferred-citation:
+  type: article
+  title: "AeroFlyway: GPU-Accelerated Continental Avian Migration Simulation, NEXRAD Radar Ingestion, and Bioacoustic Flight-Call Classification"
+  authors:
+    - family-names: "White"
+      given-names: "Bryan P."
+      affiliation: "CRV Science Labs"
+  year: 2026
+  journal: "CRV Science Apps Preprints"
+  doi: "10.5281/zenodo.24222366"
+  url: "https://crvscience.com/apps/preprints/aeroflyway-avian-migration-radar"
+  notes: "Preprint ID: APP-PREPRINT-01"

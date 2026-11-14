@@ -27,3 +27,23 @@ cargo run --release -- radar --region pacific --vpts-csv sample_vpts.csv
 # Run Rayon multi-scenario sweeps jointly varying turbine cut-in & Lights-Out curfew %
 cargo run --release -- batch --region atlantic --ssp ssp245 --cut-in 3.5,5.0,6.0 --lights-out 0,50,85 --export-best-geojson
 ```
+
+## Citation & CRV Science Apps Hub
+
+- **CRV Science Apps Hub**: <https://crvscience.com/apps>
+- **Companion Preprint (`APP-PREPRINT-01`)**: [AeroFlyway: GPU-Accelerated Continental Avian Migration Simulation, NEXRAD Radar Ingestion, and Bioacoustic Flight-Call Classification](https://crvscience.com/apps/preprints/aeroflyway-avian-migration-radar)
+- **Zenodo Concept DOI**: [10.5281/zenodo.24222366](https://doi.org/10.5281/zenodo.24222366)
+- **Validation Suite & Telemetry**: [`validation/README.md`](validation/README.md) (`cargo test`)
+- **Machine-Readable Metadata**: [`CITATION.cff`](CITATION.cff)
+
+```bibtex
+@article{White2026AeroFlyway,
+  author  = {White, Bryan P.},
+  title   = {AeroFlyway: GPU-Accelerated Continental Avian Migration Simulation, NEXRAD Radar Ingestion, and Bioacoustic Flight-Call Classification},
+  journal = {CRV Science Apps Preprints},
+  year    = {2026},
+  doi     = {10.5281/zenodo.24222366},
+  url     = {https://crvscience.com/apps/preprints/aeroflyway-avian-migration-radar},
+  note    = {Software v0.6.0; Preprint ID: APP-PREPRINT-01}
+}
+```

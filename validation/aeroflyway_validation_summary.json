@@ -1,0 +1,146 @@
+{
+  "concept_doi": "10.5281/zenodo.24222366",
+  "preprint_id": "APP-PREPRINT-01",
+  "preprint_url": "https://crvscience.com/apps/preprints/aeroflyway-avian-migration-radar",
+  "repo": "crvscience-aeroflyway",
+  "schema_version": "1.0",
+  "tests": {
+    "t1_lights_out_collision_mortality": {
+      "avoided_urban_strikes_80pct": 94.44444444444444,
+      "baseline_peak_entrained_birds": 153,
+      "baseline_strikes_0pct": 35,
+      "csv_artifact": "validation/lights_out_mortality_curve.csv",
+      "intervention_peak_entrained_birds_80pct": 111,
+      "intervention_strikes_80pct": 1,
+      "region": "atlantic",
+      "season": "AutumnFalloutAndBatPulse",
+      "sim_hours": 36.0,
+      "sweep_levels": [
+        {
+          "avoided_urban_strikes_pct": 0.0,
+          "baseline_unmitigated_strikes": 35,
+          "cumulative_urban_strikes": 35,
+          "effective_skyglow_radiance_nw": 85.0,
+          "lights_out_pct": 0.0,
+          "mean_alt_agl_m": 772.3859434532985,
+          "peak_nocturnal_airborne_birds": 1000,
+          "peak_nocturnal_entrained_birds": 153,
+          "sim_hours": 59.25,
+          "theoretical_collision_reduction_pct": 0.0
+        },
+        {
+          "avoided_urban_strikes_pct": 31.25,
+          "baseline_unmitigated_strikes": 32,
+          "cumulative_urban_strikes": 22,
+          "effective_skyglow_radiance_nw": 70.03999999999999,
+          "lights_out_pct": 20.0,
+          "mean_alt_agl_m": 786.590849051848,
+          "peak_nocturnal_airborne_birds": 1000,
+          "peak_nocturnal_entrained_birds": 149,
+          "sim_hours": 59.25,
+          "theoretical_collision_reduction_pct": 27.763330300124032
+        },
+        {
+          "avoided_urban_strikes_pct": 69.23076923076923,
+          "baseline_unmitigated_strikes": 26,
+          "cumulative_urban_strikes": 8,
+          "effective_skyglow_radiance_nw": 55.07999999999999,
+          "lights_out_pct": 40.0,
+          "mean_alt_agl_m": 796.0669115638054,
+          "peak_nocturnal_airborne_birds": 1000,
+          "peak_nocturnal_entrained_birds": 133,
+          "sim_hours": 59.25,
+          "theoretical_collision_reduction_pct": 51.755699947972936
+        },
+        {
+          "avoided_urban_strikes_pct": 71.42857142857143,
+          "baseline_unmitigated_strikes": 21,
+          "cumulative_urban_strikes": 6,
+          "effective_skyglow_radiance_nw": 40.12,
+          "lights_out_pct": 60.0,
+          "mean_alt_agl_m": 859.8646749233197,
+          "peak_nocturnal_airborne_birds": 1000,
+          "peak_nocturnal_entrained_birds": 112,
+          "sim_hours": 59.25,
+          "theoretical_collision_reduction_pct": 71.67156662722931
+        },
+        {
+          "avoided_urban_strikes_pct": 94.44444444444444,
+          "baseline_unmitigated_strikes": 18,
+          "cumulative_urban_strikes": 1,
+          "effective_skyglow_radiance_nw": 25.159999999999993,
+          "lights_out_pct": 80.0,
+          "mean_alt_agl_m": 405.2021541847739,
+          "peak_nocturnal_airborne_birds": 1000,
+          "peak_nocturnal_entrained_birds": 111,
+          "sim_hours": 59.25,
+          "theoretical_collision_reduction_pct": 87.0648915405465
+        },
+        {
+          "avoided_urban_strikes_pct": 95.0,
+          "baseline_unmitigated_strikes": 7,
+          "cumulative_urban_strikes": 1,
+          "effective_skyglow_radiance_nw": 10.2,
+          "lights_out_pct": 100.0,
+          "mean_alt_agl_m": 408.15190176630205,
+          "peak_nocturnal_airborne_birds": 1000,
+          "peak_nocturnal_entrained_birds": 103,
+          "sim_hours": 59.25,
+          "theoretical_collision_reduction_pct": 95.0
+        }
+      ]
+    },
+    "t2_nexrad_vpts_profile_integration": {
+      "clutter_rows_filtered": 1,
+      "csv_artifact": "validation/vpts_altitude_profile.csv",
+      "parsed_mtr_birds_km_hr": 1507.7151021336413,
+      "parsed_peak_altitude_m_asl": 600.0,
+      "parsed_station": "KDOX",
+      "peak_bin_density_per_km3": 44.2,
+      "regional_profiles": [
+        {
+          "bin_count": 20,
+          "mtr_birds_km_hr": 777.0430242083959,
+          "peak_altitude_m_asl": 1000.0,
+          "station_code": "KDIX",
+          "station_name": "Philadelphia / Fort Dix NJ"
+        },
+        {
+          "bin_count": 20,
+          "mtr_birds_km_hr": 1036.9994931584808,
+          "peak_altitude_m_asl": 1200.0,
+          "station_code": "KAKQ",
+          "station_name": "Wakefield / Chesapeake VA"
+        }
+      ],
+      "regional_station_count": 2,
+      "retained_avian_bins": 12
+    },
+    "t3_bioacoustic_stft_sqlite_roundtrip": {
+      "duet_aci_index": 258.5603434729248,
+      "duet_pulses_detected": 2,
+      "guano_lat": 40.7128,
+      "guano_lon": -74.006,
+      "sqlite_campaign_lights_out_pct": 80.0,
+      "sqlite_campaign_name": "Atlantic Headless NFC Validation",
+      "sqlite_total_observations": 9,
+      "sqlite_upserted_nfc_records": 2,
+      "sqlite_upserted_radar_bins": 2,
+      "thrush_band_2_3_4_2_mean_dbfs": -69.38731365316319,
+      "thrush_band_2_3_4_2_peak_dbfs": -5.03458309173584,
+      "thrush_band_6_2_8_2_mean_dbfs": -72.74505736992793,
+      "thrush_band_6_2_8_2_peak_dbfs": -21.041072845458984,
+      "thrush_characteristic_freq_khz": 3.4609375,
+      "thrush_guild": "Passerine Thrush Nocturnal Flight Call",
+      "warbler_band_2_3_4_2_mean_dbfs": -75.39169985248196,
+      "warbler_band_2_3_4_2_peak_dbfs": -63.21282958984375,
+      "warbler_band_6_2_8_2_mean_dbfs": -67.51833999651369,
+      "warbler_band_6_2_8_2_peak_dbfs": -10.762123107910156,
+      "warbler_characteristic_freq_khz": 7.32421875,
+      "warbler_guild": "High-Zeep Warbler Nocturnal Flight Call",
+      "wav_duration_ms": 650.0,
+      "wav_sample_rate_hz": 48000
+    }
+  },
+  "version": "0.6.0"
+}

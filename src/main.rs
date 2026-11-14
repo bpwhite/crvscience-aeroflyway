@@ -4,30 +4,20 @@
 //! - NEXRAD WSR-88D & ENRAM Aloft Vertical Radar Profile (`VPTS`) Ingestion & Altitude Explorer
 //! - Continuous 365-Day DOY Phenology, Open-Meteo CMIP6 + CAMS PM2.5 Smoke Forcing & WAV STFT Lab.
 
-mod acoustics;
-mod basemap;
-mod cli;
-mod db;
-mod export;
-mod gpu_pipeline;
-mod ingest;
-mod map_engine;
-mod physics;
-
-use acoustics::{
+use aeroflyway::acoustics::{
     compute_stft_spectrogram, load_wav_file, parse_wav_bytes, synthesize_preset_recording,
     write_wav_16bit, SpectrogramResult, SynthPreset, WavRecording,
 };
-use basemap::{
+use aeroflyway::basemap::{
     landmarks_for_region, radar_stations_for_region, skyglow_domes_for_region, FlywayRegion,
     LandmarkKind, MilkweedPatch, Taxon, WindTurbine, COLUMBIA_RIVER, KLAMATH_SACRAMENTO_CORRIDOR,
     PACIFIC_COASTLINE, PUGET_SOUND_RING, STATE_BOUNDARIES, WILLAMETTE_RIVER,
 };
-use cli::{
+use aeroflyway::cli::{
     execute_batch_sweep_grid, try_dispatch_cli, write_batch_sweep_reports, BatchScenarioOutcome,
     CliDispatchOutcome,
 };
-use db::{
+use aeroflyway::db::{
     hex_bin_center, spatial_hex_bin, CampaignSummary, FlywayStore, ModelSnapshot, ObservationRecord,
 };
 use eframe::egui::{
@@ -35,18 +25,18 @@ use eframe::egui::{
     TextureHandle, TextureOptions, Vec2,
 };
 use eframe::egui_wgpu;
-use export::{export_corridor_csv_bundle, export_corridor_geojson};
-use gpu_pipeline::{
+use aeroflyway::export::{export_corridor_csv_bundle, export_corridor_geojson};
+use aeroflyway::gpu_pipeline::{
     pack_gpu_scene_buffers, pack_gpu_uniforms, FlywayGpuResources, GpuReadbackSummary,
     MapGpuSimAndPaintCallback, SharedReadbackHandle, TransectGpuPaintCallback, DEFAULT_GPU_AGENTS,
     MAX_GPU_AGENTS,
 };
-use ingest::{
+use aeroflyway::ingest::{
     build_regional_radar_profiles, load_vpts_csv_file, spawn_live_ingest, Cmip6Scenario,
     IngestPayload,
 };
-use map_engine::{haversine_km, BasemapProvider, MapViewport};
-use physics::{
+use aeroflyway::map_engine::{haversine_km, BasemapProvider, MapViewport};
+use aeroflyway::physics::{
     compute_lights_out_collision_reduction_pct, default_synoptic_nodes_for_region,
     effective_skyglow_radiance_nw, AeroPhysicsEngine, SeasonPreset, SimulationParams,
 };
