@@ -1,0 +1,22 @@
+[package]
+name = "aeroflyway"
+version = "0.6.0"
+edition = "2021"
+description = "Native Rust wgpu/WGSL 100k-agent multi-flyway GIS workstation with Startup Campaign Hub, VIIRS nighttime skyglow Lights-Out collision modeling, NEXRAD/Aloft vertical radar profile ingestion, 365-day phenology, CMIP6 + PM2.5 smoke forcing, and WAV STFT bioacoustics"
+license = "MIT"
+
+[dependencies]
+bytemuck = { version = "1.21", features = ["derive"] }
+eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts", "glow"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rayon = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wgpu = "24.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
