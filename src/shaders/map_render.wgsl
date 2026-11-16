@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 // AeroFlyway v0.6.0 — Zero-Copy Instanced Map Render Shader (`map_render.wgsl`)
 // Renders up to 100,000 VRAM-resident agents across any global flyway using relative-to-center
 // spherical Web Mercator projection, highlighting rain fallout (emerald), smoke climb (coral),
@@ -147,10 +162,10 @@ fn vs_main(
     let show_trails = (sim.layer_bits & 32u) != 0u;
     var tail_stretch = 1.0;
     if (show_trails) {
-        tail_stretch = clamp(1.0 + speed * 0.22, 1.0, 4.2);
+        tail_stretch = clamp(1.0 + speed * 0.11, 1.0, 2.4);
     }
 
-    let base_px = clamp(2.1 + log2(max(sim.zoom_scale_px / 256.0, 1.0)) * 0.32, 2.0, 5.2);
+    let base_px = clamp(1.15 + log2(max(sim.zoom_scale_px / 256.0, 1.0)) * 0.16, 1.2, 2.8);
     let uv = quad_corner(vert_idx);
 
     var along = uv.y * base_px;

@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 //! Headless CLI Subcommand Suite & Multi-Scenario Rayon Batch Runner (`src/cli.rs` — v0.6.0).
 //! Supports zero-windowing execution on headless Linux/SSH/CI servers:
 //! - `aeroflyway [gui] [--skip-hub]` : Launches native `eframe` + `wgpu` 100k-agent GIS workstation
@@ -29,10 +44,11 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliDispatchOutcome {
     HandledExit,
     LaunchGui { skip_startup_hub: bool },
+    Screenshot { out_path: PathBuf, view: u8 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -106,6 +122,39 @@ pub fn try_dispatch_cli() -> Result<CliDispatchOutcome, String> {
     if args.is_empty() {
         return Ok(CliDispatchOutcome::LaunchGui {
             skip_startup_hub: false,
+        });
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--screenshot") {
+        let out = args
+            .get(pos + 1)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "Missing output PNG path after `--screenshot`.".to_string())?;
+        let view = if let Some(vpos) = args
+            .iter()
+            .position(|a| a == "--screenshot-view" || a == "--view")
+        {
+            let raw = args
+                .get(vpos + 1)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "Missing view index after `--screenshot-view`.".to_string())?;
+            let parsed: u8 = raw
+                .parse()
+                .map_err(|_| format!("Invalid screenshot view '{raw}' (expected 1, 2, or 3)."))?;
+            if !(1..=3).contains(&parsed) {
+                return Err(format!(
+                    "Unsupported screenshot view {parsed} (expected 1, 2, or 3)."
+                ));
+            }
+            parsed
+        } else {
+            1
+        };
+        return Ok(CliDispatchOutcome::Screenshot {
+            out_path: PathBuf::from(out),
+            view,
         });
     }
 

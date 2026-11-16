@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 //! `wgpu` + WGSL Compute & Zero-Copy Instanced Rendering Pipeline (`gpu_pipeline.rs` — v0.6.0).
 //! Manages up to `100,000` GPU-resident multi-taxa agents in VRAM (`4.8 MB`), executing:
 //! 1. `@compute @workgroup_size(256)` global-region DOY phenology, CMIP6 trophic mismatch,

@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 //! AeroFlyway v0.6.0 — Native Rust `wgpu` + WGSL 100k-Agent Multi-Flyway GIS Workstation:
 //! - Startup Campaign Hub (`AppStage::StartupHub`) + Native Persistent Menu Bar (`egui::menu::bar`)
 //! - VIIRS Nighttime Skyglow Urban Collision Modeling & BirdCast `Lights-Out` Curfew Sliders
@@ -226,6 +241,7 @@ struct AeroFlywayApp {
     gpu_cum_urban_baseline: u64,
 
     bottom_tab: BottomDockTab,
+    bottom_dock_default_height: f32,
     acoustics: AcousticInspectorState,
     batch_ui: BatchSweepUiState,
     export_dir_input: String,
@@ -245,11 +261,29 @@ struct AeroFlywayApp {
 
 impl AeroFlywayApp {
     fn new(cc: &eframe::CreationContext<'_>, skip_startup_hub: bool) -> Self {
-        configure_dark_telemetry_visuals(&cc.egui_ctx);
+        Self::new_with_wgpu(
+            &cc.egui_ctx,
+            cc.wgpu_render_state.as_ref(),
+            PathBuf::from("aeroflyway.db"),
+            skip_startup_hub,
+        )
+    }
 
-        let db_path = PathBuf::from("aeroflyway.db");
+    fn new_with_wgpu(
+        ctx: &egui::Context,
+        wgpu_render_state: Option<&egui_wgpu::RenderState>,
+        db_path: PathBuf,
+        skip_startup_hub: bool,
+    ) -> Self {
+        configure_dark_telemetry_visuals(ctx);
+
+        let db_name = db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("aeroflyway.db")
+            .to_string();
         let store = FlywayStore::open(&db_path).expect("Failed to initialize aeroflyway.db");
-        let active_campaign = store.load_campaign_summary("aeroflyway.db");
+        let active_campaign = store.load_campaign_summary(&db_name);
         let observations = store.load_observations();
         let turbines = store.load_turbines();
         let milkweed = store.load_milkweed_patches();
@@ -258,7 +292,7 @@ impl AeroFlywayApp {
         let gpu_readback = SharedReadbackHandle::new();
         let mut gpu_available = false;
 
-        if let Some(wgpu_render_state) = cc.wgpu_render_state.as_ref() {
+        if let Some(wgpu_render_state) = wgpu_render_state {
             let gpu_res = FlywayGpuResources::initialize(
                 wgpu_render_state,
                 params.region,
@@ -291,7 +325,7 @@ impl AeroFlywayApp {
                 AppStage::StartupHub
             },
             campaign_name_input: active_campaign.campaign_name.clone(),
-            campaign_db_path_input: "aeroflyway.db".to_string(),
+            campaign_db_path_input: db_name,
             active_campaign,
             show_help_modal: false,
             selected_radar_idx: 0,
@@ -316,6 +350,7 @@ impl AeroFlywayApp {
             gpu_cum_urban_strikes: 0,
             gpu_cum_urban_baseline: 0,
             bottom_tab: BottomDockTab::AirspaceTransect,
+            bottom_dock_default_height: 255.0,
             acoustics: AcousticInspectorState::new_with_default_preset(),
             batch_ui: BatchSweepUiState::new(),
             export_dir_input: "exports".to_string(),
@@ -1303,8 +1338,8 @@ impl AeroFlywayApp {
                         ui.add_space(5.0);
                         ui.label("GPU Instanced Swarm Size (VRAM Zero-Copy)");
                         ui.add(
-                            egui::Slider::new(&mut self.gpu_agent_count, 10_000..=MAX_GPU_AGENTS)
-                                .step_by(2048.0)
+                            egui::Slider::new(&mut self.gpu_agent_count, 2_048..=MAX_GPU_AGENTS)
+                                .step_by(1024.0)
                                 .suffix(" agents"),
                         );
                     }
@@ -1468,7 +1503,7 @@ impl AeroFlywayApp {
     fn render_bottom_dock(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("bottom_workbench_dock")
             .resizable(true)
-            .default_height(255.0)
+            .default_height(self.bottom_dock_default_height)
             .min_height(185.0)
             .max_height(440.0)
             .show(ctx, |ui| {
@@ -2653,8 +2688,8 @@ impl AeroFlywayApp {
     }
 }
 
-impl eframe::App for AeroFlywayApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl AeroFlywayApp {
+    fn render_ui(&mut self, ctx: &egui::Context) {
         self.handle_keyboard_shortcuts(ctx);
         self.handle_dropped_wav_files(ctx);
         self.poll_background_channels();
@@ -2704,6 +2739,12 @@ impl eframe::App for AeroFlywayApp {
     }
 }
 
+impl eframe::App for AeroFlywayApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render_ui(ctx);
+    }
+}
+
 fn parse_ui_list<T: std::str::FromStr + Copy>(raw: &str, fallback: &[T]) -> Vec<T> {
     let parsed: Vec<T> = raw
         .split(',')
@@ -2732,9 +2773,258 @@ fn configure_dark_telemetry_visuals(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
+fn block_on_future<F: std::future::Future>(fut: F) -> F::Output {
+    struct ThreadUnparker(std::thread::Thread);
+    impl std::task::Wake for ThreadUnparker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(ThreadUnparker(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(val) => return val,
+            std::task::Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+fn run_headless_screenshot(out_path: &std::path::Path, view: u8) -> Result<(), String> {
+    use eframe::egui_wgpu::wgpu;
+
+    const WIDTH: u32 = 1600;
+    const HEIGHT: u32 = 1000;
+    const BYTES_PER_ROW: u32 = WIDTH * 4;
+
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = block_on_future(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .or_else(|| {
+        block_on_future(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: true,
+        }))
+    })
+    .ok_or_else(|| "No wgpu adapter found for offscreen screenshot.".to_string())?;
+
+    let (device, queue) =
+        block_on_future(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+            .map_err(|e| format!("Failed to request wgpu device: {e}"))?;
+
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+    let render_state = egui_wgpu::RenderState {
+        adapter,
+        available_adapters: Vec::new(),
+        device: device.clone(),
+        queue: queue.clone(),
+        target_format: format,
+        renderer: Arc::new(egui::mutex::RwLock::new(renderer)),
+    };
+
+    let temp_db =
+        std::env::temp_dir().join(format!("aeroflyway_headless_{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&temp_db);
+
+    let ctx = egui::Context::default();
+    let mut app = AeroFlywayApp::new_with_wgpu(&ctx, Some(&render_state), temp_db.clone(), true);
+    app.campaign_db_path_input = "aeroflyway.db".to_string();
+    app.gpu_agent_count = 3072;
+    app.sim_speed_hr_per_sec = 6.0;
+    app.map.zoom = 5.95;
+    app.engine.step(
+        3.0,
+        &app.params,
+        &app.turbines,
+        &app.milkweed,
+        &app.observations,
+    );
+    match view {
+        2 => {
+            app.bottom_tab = BottomDockTab::RadarVerticalProfile;
+            app.bottom_dock_default_height = 375.0;
+            app.selected_radar_idx = 0;
+            app.layers.wind_barbs = true;
+            app.layers.radar_rings = true;
+            if let Some(prof) = app.engine.radar_profiles.first() {
+                app.map.jump_to(prof.lat, prof.lon, 6.75);
+            }
+        }
+        3 => {
+            app.bottom_tab = BottomDockTab::AcousticSpectrogram;
+            app.bottom_dock_default_height = 395.0;
+            let rec = synthesize_preset_recording(SynthPreset::MyotisBuzzUltrasonic250k);
+            app.acoustics.fft_size = 512;
+            app.acoustics.load_new_recording(rec);
+            app.acoustics.show_ridge_overlay = true;
+            app.pin_current_acoustic_detection();
+            app.map.zoom = 6.15;
+        }
+        _ => {}
+    }
+
+    let extent = wgpu::Extent3d {
+        width: WIDTH,
+        height: HEIGHT,
+        depth_or_array_layers: 1,
+    };
+    let render_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("aeroflyway_headless_target"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let render_view = render_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("aeroflyway_headless_readback"),
+        size: (BYTES_PER_ROW as u64) * (HEIGHT as u64),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    for frame_idx in 0..4_u32 {
+        let raw_input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(WIDTH as f32, HEIGHT as f32),
+            )),
+            predicted_dt: 0.08,
+            time: Some((frame_idx as f64) * 0.08),
+            ..Default::default()
+        };
+
+        let full_output = ctx.run(raw_input, |ctx| {
+            app.render_ui(ctx);
+        });
+        let paint_jobs = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [WIDTH, HEIGHT],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+
+        let mut renderer_guard = render_state.renderer.write();
+        for (id, delta) in &full_output.textures_delta.set {
+            renderer_guard.update_texture(&device, &queue, *id, delta);
+        }
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("aeroflyway_headless_encoder"),
+        });
+        let user_cmds = renderer_guard.update_buffers(
+            &device,
+            &queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+
+        {
+            let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("aeroflyway_headless_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &render_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 8.0 / 255.0,
+                            g: 13.0 / 255.0,
+                            b: 21.0 / 255.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            let mut rpass = rpass.forget_lifetime();
+            renderer_guard.render(&mut rpass, &paint_jobs, &screen_descriptor);
+        }
+
+        if frame_idx == 3 {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &render_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &staging_buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(BYTES_PER_ROW),
+                        rows_per_image: Some(HEIGHT),
+                    },
+                },
+                extent,
+            );
+        }
+
+        queue.submit(user_cmds.into_iter().chain(std::iter::once(encoder.finish())));
+        device.poll(wgpu::Maintain::Wait);
+
+        for id in &full_output.textures_delta.free {
+            renderer_guard.free_texture(id);
+        }
+    }
+
+    let slice = staging_buf.slice(..);
+    let (tx, rx) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    rx.recv()
+        .map_err(|e| format!("Readback channel failed: {e}"))?
+        .map_err(|e| format!("Buffer map failed: {e}"))?;
+
+    let rgba = slice.get_mapped_range().to_vec();
+    let _ = slice;
+    staging_buf.unmap();
+
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create output directory: {e}"))?;
+        }
+    }
+    image::save_buffer(out_path, &rgba, WIDTH, HEIGHT, image::ColorType::Rgba8)
+        .map_err(|e| format!("Failed to write PNG screenshot: {e}"))?;
+
+    let _ = std::fs::remove_file(&temp_db);
+    let _ = std::fs::remove_file(format!("{}-wal", temp_db.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", temp_db.display()));
+
+    Ok(())
+}
+
 fn main() -> eframe::Result<()> {
     let skip_hub = match try_dispatch_cli() {
         Ok(CliDispatchOutcome::HandledExit) => return Ok(()),
+        Ok(CliDispatchOutcome::Screenshot { out_path, view }) => {
+            if let Err(err) = run_headless_screenshot(&out_path, view) {
+                eprintln!("[AeroFlyway Screenshot Error] {err}");
+                std::process::exit(1);
+            }
+            println!(
+                "Saved {} (1600x1000 RGBA offscreen screenshot, view {view})",
+                out_path.display()
+            );
+            return Ok(());
+        }
         Ok(CliDispatchOutcome::LaunchGui { skip_startup_hub }) => skip_startup_hub,
         Err(err) => {
             eprintln!("[AeroFlyway CLI Error] {err}");

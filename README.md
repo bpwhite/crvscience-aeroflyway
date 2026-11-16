@@ -1,5 +1,7 @@
 # AeroFlyway v0.6.0
 
+![AeroFlyway Headless Workbench](validation/headless_screenshot.png)
+
 Pure-Rust desktop aeroecology GIS, `wgpu`/WGSL 100,000-agent multi-flyway simulator, **Startup Campaign Hub**, **VIIRS nighttime skyglow `Lights-Out` urban collision model**, **NEXRAD WSR-88D / ENRAM Aloft vertical radar profile (`VPTS`) analyzer**, continuous 365-day phenology engine, and WAV/GUANO bioacoustic STFT workbench.
 
 ## What's New in v0.6.0
@@ -31,7 +33,7 @@ cargo run --release -- batch --region atlantic --ssp ssp245 --cut-in 3.5,5.0,6.0
 ## Citation & CRV Science Apps Hub
 
 - **CRV Science Apps Hub**: <https://crvscience.com/apps>
-- **Companion Preprint (`APP-PREPRINT-01`)**: [AeroFlyway: GPU-Accelerated Continental Avian Migration Simulation, NEXRAD Radar Ingestion, and Bioacoustic Flight-Call Classification](https://crvscience.com/apps/preprints/aeroflyway-avian-migration-radar)
+- **Companion Preprint (`APP-PREPRINT-13`)**: [AeroFlyway: Tracking Bird Migration with Weather Radar, Skyglow Maps, and Nighttime Flight Calls](https://crvscience.com/apps/preprints/aeroflyway-avian-migration-radar)
 - **Zenodo Concept DOI**: [10.5281/zenodo.24222366](https://doi.org/10.5281/zenodo.24222366)
 - **Validation Suite & Telemetry**: [`validation/README.md`](validation/README.md) (`cargo test`)
 - **Machine-Readable Metadata**: [`CITATION.cff`](CITATION.cff)
@@ -44,6 +46,6 @@ cargo run --release -- batch --region atlantic --ssp ssp245 --cut-in 3.5,5.0,6.0
   year    = {2026},
   doi     = {10.5281/zenodo.24222366},
   url     = {https://crvscience.com/apps/preprints/aeroflyway-avian-migration-radar},
-  note    = {Software v0.6.0; Preprint ID: APP-PREPRINT-01}
+  note    = {Software v0.6.0; Preprint ID: APP-PREPRINT-13}
 }
 ```
