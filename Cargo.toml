@@ -3,7 +3,7 @@ name = "aeroflyway"
 version = "0.6.0"
 edition = "2021"
 description = "Native Rust wgpu/WGSL 100k-agent multi-flyway GIS workstation with Startup Campaign Hub, VIIRS nighttime skyglow Lights-Out collision modeling, NEXRAD/Aloft vertical radar profile ingestion, 365-day phenology, CMIP6 + PM2.5 smoke forcing, and WAV STFT bioacoustics"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 bytemuck = { version = "1.21", features = ["derive"] }
