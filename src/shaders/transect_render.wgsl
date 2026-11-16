@@ -67,6 +67,11 @@ struct SimUniforms {
     radar_peak_alt_m: f32,
     radar_nudge_weight: f32,
     skyglow_intensity_mult: f32,
+
+    cam_pitch_rad: f32,
+    cam_bearing_rad: f32,
+    cam_alt_exag: f32,
+    _cam_pad: f32,
 };
 
 struct GpuAgent {

@@ -68,6 +68,11 @@ struct SimUniforms {
     radar_peak_alt_m: f32,
     radar_nudge_weight: f32,
     skyglow_intensity_mult: f32,
+
+    cam_pitch_rad: f32,
+    cam_bearing_rad: f32,
+    cam_alt_exag: f32,
+    _cam_pad: f32,
 };
 
 struct GpuAgent {
@@ -95,6 +100,7 @@ struct VsOut {
     @location(0) local_uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) taxon: u32,
+    @location(3) wing_phase: f32,
 };
 
 fn quad_corner(v_idx: u32) -> vec2<f32> {
@@ -136,105 +142,155 @@ fn vs_main(
     if (dlon > 180.0) { dlon = dlon - 360.0; }
     if (dlon < -180.0) { dlon = dlon + 360.0; }
 
-    let dx_pts = (dlon / 360.0) * sim.zoom_scale_px;
+    let ge = (dlon / 360.0) * sim.zoom_scale_px;
     let lat_rad = clamp(ag.lat, -85.0511, 85.0511) * 0.01745329252;
     let merc_n = log(tan(0.7853981634 + 0.5 * lat_rad));
-    let dy_pts = -((merc_n - sim.center_merc_n) / 6.2831853072) * sim.zoom_scale_px;
+    let gn = ((merc_n - sim.center_merc_n) / 6.2831853072) * sim.zoom_scale_px;
+
+    let cb = cos(sim.cam_bearing_rad);
+    let sb = sin(sim.cam_bearing_rad);
+    let cp = cos(sim.cam_pitch_rad);
+    let sp = sin(sim.cam_pitch_rad);
+
+    let rx = ge * cb - gn * sb;
+    let fy = ge * sb + gn * cb;
+    let elev_z = (ag.alt_agl_m / 36.0) * max(sim.cam_alt_exag, 0.0);
+    let cam_d = max(sim.canvas_h_pts * 1.15, 680.0);
+    let depth = fy * sp - elev_z * cp;
+    let persp = cam_d / max(cam_d + depth, cam_d * 0.22);
+
+    let sx_pts = rx * persp;
+    let sy_pts = -((fy * cp + elev_z * sp) * persp);
 
     let half_w = max(sim.canvas_w_pts * 0.5, 1.0);
     let half_h = max(sim.canvas_h_pts * 0.5, 1.0);
 
-    if ((abs(dx_pts) > half_w + 24.0) || (abs(dy_pts) > half_h + 24.0)) {
+    if ((abs(sx_pts) > half_w + 48.0) || (abs(sy_pts) > half_h + 48.0)) {
         out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
         out.local_uv = vec2<f32>(0.0, 0.0);
         out.color = vec4<f32>(0.0);
         out.taxon = ag.taxon;
+        out.wing_phase = 0.0;
         return out;
     }
 
     let speed = sqrt(max(ag.vel_u_mps * ag.vel_u_mps + ag.vel_v_mps * ag.vel_v_mps, 0.0));
-    var fwd_screen = vec2<f32>(0.0, -1.0);
+    var vu = sin(sim.heading_rad);
+    var vv = cos(sim.heading_rad);
     if (speed > 0.15) {
-        fwd_screen = vec2<f32>(ag.vel_u_mps / speed, -ag.vel_v_mps / speed);
+        vu = ag.vel_u_mps / speed;
+        vv = ag.vel_v_mps / speed;
     }
+    let rot_u = vu * cb - vv * sb;
+    let rot_v = (vu * sb + vv * cb) * cp;
+    let fwd_raw = vec2<f32>(rot_u, -rot_v);
+    let fwd_len = max(length(fwd_raw), 1e-4);
+    let fwd_screen = fwd_raw / fwd_len;
     let right_screen = vec2<f32>(-fwd_screen.y, fwd_screen.x);
 
-    let show_trails = (sim.layer_bits & 32u) != 0u;
-    var tail_stretch = 1.0;
-    if (show_trails) {
-        tail_stretch = clamp(1.0 + speed * 0.11, 1.0, 2.4);
-    }
+    let is_roost = (ag.flags & 16u) != 0u;
+    let zoom_lvl = log2(max(sim.zoom_scale_px / 256.0, 1.0));
+    let quad_diam_pt = clamp(6.8 + max(zoom_lvl - 3.5, 0.0) * 0.72, 6.5, 10.5) * select(1.0, 0.80, is_roost);
+    let base_px = quad_diam_pt * 0.56 * clamp(persp, 0.78, 1.25);
 
-    let base_px = clamp(1.15 + log2(max(sim.zoom_scale_px / 256.0, 1.0)) * 0.16, 1.2, 2.8);
     let uv = quad_corner(vert_idx);
-
-    var along = uv.y * base_px;
-    if (uv.y < 0.0) {
-        along = uv.y * base_px * tail_stretch;
-    }
+    let along = uv.y * base_px;
     let across = uv.x * base_px;
 
-    let pt_x = dx_pts + right_screen.x * across + fwd_screen.x * along;
-    let pt_y = dy_pts + right_screen.y * across + fwd_screen.y * along;
+    let pt_x = sx_pts + right_screen.x * across + fwd_screen.x * along;
+    let pt_y = sy_pts + right_screen.y * across + fwd_screen.y * along;
 
     let ndc_x = pt_x / half_w;
     let ndc_y = -pt_y / half_h;
 
-    var col = vec4<f32>(0.22, 0.74, 0.97, 0.78);
+    var col = vec4<f32>(0.22, 0.74, 0.97, 0.82);
     if (ag.taxon == 0u) {
         if ((ag.flags & 8u) != 0u) {
-            col = vec4<f32>(0.99, 0.42, 0.78, 0.92);
+            col = vec4<f32>(0.98, 0.44, 0.76, 0.82);
         } else if ((ag.flags & 4u) != 0u) {
-            col = vec4<f32>(0.99, 0.52, 0.24, 0.90);
+            col = vec4<f32>(0.98, 0.54, 0.24, 0.82);
         } else if ((ag.flags & 1u) != 0u) {
-            col = vec4<f32>(0.30, 0.95, 0.75, 0.90);
+            col = vec4<f32>(0.28, 0.90, 0.72, 0.82);
         } else {
-            col = vec4<f32>(0.22, 0.74, 0.97, 0.76);
+            // Cyan #38BDF8
+            col = vec4<f32>(0.22, 0.74, 0.97, 0.82);
         }
     } else if (ag.taxon == 1u) {
         if ((ag.flags & 2u) != 0u) {
-            col = vec4<f32>(0.98, 0.28, 0.42, 0.95);
+            col = vec4<f32>(0.98, 0.30, 0.44, 0.82);
         } else {
-            col = vec4<f32>(0.75, 0.52, 0.99, 0.80);
+            // Violet #C084FC
+            col = vec4<f32>(0.75, 0.52, 0.99, 0.82);
         }
     } else {
+        // Monarch Gold/Orange #FB923C
         let gen_f = clamp(f32(ag.generation) * 0.25, 0.25, 1.0);
-        col = vec4<f32>(0.99, 0.82 - 0.26 * gen_f, 0.16, 0.84);
+        col = vec4<f32>(0.98, 0.62 - 0.10 * gen_f, 0.22, 0.82);
+    }
+    if (is_roost) {
+        col.a = 0.22;
     }
 
     out.clip_pos = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
     out.local_uv = uv;
     out.color = col;
     out.taxon = ag.taxon;
+    out.wing_phase = sin(sim.hour_of_day * 16.0 + f32(inst_idx) * 1.91);
     return out;
+}
+
+fn sd_capsule_pt(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let pa = p - a;
+    let ba = b - a;
+    let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+    return length(pa - ba * h);
 }
 
 @fragment
 fn fs_main(in_frag: VsOut) -> @location(0) vec4<f32> {
-    let u = in_frag.local_uv.x;
-    let v = in_frag.local_uv.y;
+    let ax = abs(in_frag.local_uv.x);
+    let y = in_frag.local_uv.y;
+    let p = vec2<f32>(ax, y);
 
-    var shape_d = 0.0;
+    var sdf = 1.0;
     if (in_frag.taxon == 0u) {
-        let nose = abs(u) * 0.85 + max(v, -0.35 * abs(u));
-        shape_d = max(abs(u), nose);
+        // BIRD: Swept chevron wings + wingbeat flex + fuselage + forked swallow tail
+        let flex = in_frag.wing_phase * 0.14;
+        let wing_d = sd_capsule_pt(p, vec2<f32>(0.04, 0.24), vec2<f32>(0.88, -0.30 + flex)) - (0.14 - 0.085 * ax);
+        let body_d = sd_capsule_pt(p, vec2<f32>(0.0, -0.36), vec2<f32>(0.0, 0.64)) - 0.105;
+        let tail_d = sd_capsule_pt(p, vec2<f32>(0.02, -0.32), vec2<f32>(0.24, -0.78)) - 0.045;
+        sdf = min(wing_d, min(body_d, tail_d));
     } else if (in_frag.taxon == 1u) {
-        let wing = u * u * 0.75 + (v - 0.15 * (1.0 - u * u)) * (v - 0.15 * (1.0 - u * u));
-        shape_d = sqrt(max(wing, 0.0));
+        // BAT: Twin pointed ears + 3 scalloped trailing wing cutouts
+        let body_d = length(vec2<f32>(ax / 0.13, (y - 0.06) / 0.36)) - 1.0;
+        let ear_d = sd_capsule_pt(p, vec2<f32>(0.07, 0.34), vec2<f32>(0.15, 0.68)) - 0.045;
+        var wing_d = 1.0;
+        if (ax <= 0.90) {
+            let y_lead = 0.34 - 0.24 * pow(ax, 1.35);
+            let scallop = 0.13 * abs(sin(ax * 10.4));
+            let y_trail = -0.34 + 0.14 * ax + scallop;
+            let mid_y = 0.5 * (y_lead + y_trail);
+            let half_span = max(0.5 * (y_lead - y_trail), 0.02);
+            let dy = abs(y - mid_y) - half_span;
+            let dx = ax - 0.88;
+            wing_d = max(dy, dx * 0.7);
+        }
+        sdf = min(wing_d, min(body_d * 0.14, ear_d));
     } else {
-        shape_d = abs(u) * 0.92 + abs(v) * 0.92;
+        // LEPIDOPTERA: 4-lobed forewing/hindwing butterfly + slender thorax
+        let body_d = sd_capsule_pt(p, vec2<f32>(0.0, -0.52), vec2<f32>(0.0, 0.48)) - 0.058;
+        let ant_d = sd_capsule_pt(p, vec2<f32>(0.02, 0.46), vec2<f32>(0.16, 0.74)) - 0.024;
+        let fore_p = vec2<f32>((ax - 0.44) / 0.40, (y - 0.24 - 0.10 * ax) / 0.34);
+        let fore_d = (length(fore_p) - 1.0) * 0.34;
+        let hind_p = vec2<f32>((ax - 0.33) / 0.30, (y + 0.30) / 0.28);
+        let hind_d = (length(hind_p) - 1.0) * 0.28;
+        sdf = min(min(fore_d, hind_d), min(body_d, ant_d));
     }
 
-    if (shape_d > 1.0) {
+    if (sdf > 0.06) {
         discard;
     }
-
-    let edge_fade = clamp((1.0 - shape_d) * 3.2, 0.0, 1.0);
-    var tail_fade = 1.0;
-    if (v < 0.0) {
-        tail_fade = clamp(1.0 + v * 0.78, 0.14, 1.0);
-    }
-
-    let alpha = in_frag.color.a * edge_fade * tail_fade;
+    let aa = 1.0 - smoothstep(-0.04, 0.06, sdf);
+    let alpha = in_frag.color.a * aa;
     return vec4<f32>(in_frag.color.rgb * alpha, alpha);
 }

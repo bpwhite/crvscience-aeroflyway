@@ -73,6 +73,11 @@ struct SimUniforms {
     radar_peak_alt_m: f32,
     radar_nudge_weight: f32,
     skyglow_intensity_mult: f32,
+
+    cam_pitch_rad: f32,
+    cam_bearing_rad: f32,
+    cam_alt_exag: f32,
+    _cam_pad: f32,
 };
 
 struct GpuAgent {
@@ -155,6 +160,24 @@ fn rand_unit(seed_val: u32) -> f32 {
     return f32(pcg_hash(seed_val)) / 4294967295.0;
 }
 
+fn halo_steer(dlat: f32, dlon: f32, halo_deg: f32, spin: f32) -> vec2<f32> {
+    let dist = max(sqrt(dlon * dlon + dlat * dlat), 1e-5);
+    let ru = dlon / dist;
+    let rv = dlat / dist;
+    let tu = -rv * spin;
+    let tv = ru * spin;
+    var r_pull = 0.0;
+    if (dist > halo_deg) {
+        r_pull = clamp((dist - halo_deg) / halo_deg, 0.0, 1.0);
+    } else {
+        r_pull = -clamp((halo_deg - dist) / halo_deg, 0.0, 0.72);
+    }
+    let tan_w = 0.85 * (1.0 - clamp(dist / (halo_deg * 2.4), 0.0, 1.0)) + 0.15;
+    let v = vec2<f32>(r_pull * ru + tan_w * tu, r_pull * rv + tan_w * tv);
+    let n = max(length(v), 1e-5);
+    return v / n;
+}
+
 @compute @workgroup_size(256)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -169,9 +192,32 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let jitter_a = rand_unit(seed_a) - 0.5;
     let jitter_b = rand_unit(seed_b) - 0.5;
 
-    let is_nocturnal = (sim.layer_bits & 8u) != 0u;
     let is_running = (sim.layer_bits & 16u) != 0u;
-    let is_dusk = (sim.hour_of_day >= 17.5) && (sim.hour_of_day <= 23.8);
+
+    let mid_lon = 0.5 * (sim.corridor_min_lon + sim.corridor_max_lon);
+    let mid_lat_rad = (0.5 * (sim.corridor_min_lat + sim.corridor_max_lat)) * 0.01745329252;
+    let decl = 0.40928 * sin(0.0172024 * (sim.day_of_year - 80.0));
+    let cos_h0 = clamp(-tan(mid_lat_rad) * tan(decl), -0.96, 0.96);
+    let day_len_hr = (24.0 / 3.14159265) * acos(cos_h0);
+    let sunrise_hr = clamp(12.0 - 0.5 * day_len_hr, 3.5, 9.5);
+    let sunset_hr = clamp(12.0 + 0.5 * day_len_hr, 15.0, 21.5);
+
+    let phase_hr = (rand_unit(idx * 747796405u + 2891336453u) - 0.5) * 2.2;
+    let halo_deg = 0.18 + 0.27 * rand_unit(idx * 277803737u + 1442695041u);
+    let halo_spin = select(-1.0, 1.0, (idx % 2u) == 0u);
+    var local_hr = sim.hour_of_day + (ag.lon - mid_lon) / 15.0 + phase_hr;
+    local_hr = local_hr - 24.0 * floor(local_hr / 24.0);
+
+    var nocturnal_drive = 0.0;
+    if (local_hr > 12.0) {
+        nocturnal_drive = smoothstep(sunset_hr - 1.25, sunset_hr + 0.95, local_hr);
+    } else {
+        nocturnal_drive = 1.0 - smoothstep(sunrise_hr - 0.95, sunrise_hr + 1.25, local_hr);
+    }
+    let dusk_pulse = smoothstep(sunset_hr - 1.5, sunset_hr, local_hr)
+        * (1.0 - smoothstep(sunset_hr + 0.5, sunset_hr + 3.0, local_hr));
+    let diurnal_drive = 1.0 - nocturnal_drive;
+    let bat_drive = clamp(nocturnal_drive + 0.55 * dusk_pulse, 0.0, 1.0);
 
     let seasonal_mod_c = 6.5 * sin(0.017214206 * (sim.day_of_year - 110.0));
 
@@ -236,27 +282,33 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (ag.taxon == 0u) {
             let total_precip = precip_local + sim.precip_front_mm;
             let severe_smoke = pm25_local >= 160.0;
-            ag.flags = ag.flags & (~12u);
+            ag.flags = ag.flags & (~28u);
             if (severe_smoke) {
                 ag.flags = ag.flags | 4u;
             }
             let smoke_halt = severe_smoke && ((idx % 5u) < 2u);
+            let is_diurnal_bird = (idx % 20u) >= 13u;
+            var circadian_drive = nocturnal_drive;
+            if (is_diurnal_bird) {
+                circadian_drive = diurnal_drive;
+            }
 
-            if (is_nocturnal && (total_precip < 2.2) && (!smoke_halt) && (ag.energy > 0.12)) {
-                ag.flags = ag.flags & (~1u);
+            if ((circadian_drive > 0.25) && (total_precip < 2.2) && (!smoke_halt) && (ag.energy > 0.12)) {
+                ag.flags = ag.flags & (~17u);
                 var smoke_drag = 1.0;
                 var lat_disp = 2.4;
                 if (severe_smoke) {
                     smoke_drag = 0.78;
                     lat_disp = 4.8;
                 }
-                let airspeed = 11.5 * sim.enkf_gain * smoke_drag;
+                let speed_ramp = 0.48 + 0.52 * circadian_drive;
+                let airspeed = 11.5 * sim.enkf_gain * smoke_drag * speed_ramp;
 
-                // Evaluate VIIRS urban skyglow dome phototaxis (`kind == 2u`, `weight == eff_radiance_nw`)
+                // Evaluate VIIRS urban skyglow dome phototaxis (nocturnal passerines only)
                 var best_glow = 0.0;
                 var glow_u = 0.0;
                 var glow_v = 0.0;
-                if (!severe_smoke) {
+                if (!severe_smoke && !is_diurnal_bird) {
                     for (var g_i: u32 = 0u; g_i < sim.num_attractors; g_i = g_i + 1u) {
                         let dome = attractors[g_i];
                         if (dome.kind == 2u && dome.weight > 4.0) {
@@ -269,9 +321,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 let eff_rad = dome.weight * decay;
                                 if (eff_rad > best_glow) {
                                     best_glow = eff_rad;
-                                    let inv_d = 1.0 / max(sqrt(dlx * dlx + dly * dly), 1e-5);
-                                    glow_u = dlx * inv_d;
-                                    glow_v = dly * inv_d;
+                                    let steer = halo_steer(dly, dlx, halo_deg, halo_spin);
+                                    glow_u = steer.x;
+                                    glow_v = steer.y;
                                 }
                             }
                         }
@@ -281,8 +333,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (best_glow > 14.0) {
                     ag.flags = ag.flags | 8u;
                     let pull_s = clamp(best_glow / 110.0, 0.12, 0.88);
-                    ag.vel_u_mps = airspeed * ((1.0 - 0.55 * pull_s) * dir_u + 0.75 * pull_s * glow_u) + 0.7 * u850 + jitter_a * 4.2;
-                    ag.vel_v_mps = airspeed * ((1.0 - 0.55 * pull_s) * dir_v + 0.75 * pull_s * glow_v) + 0.7 * v850 + jitter_b * 4.2;
+                    ag.vel_u_mps = airspeed * ((1.0 - 0.55 * pull_s) * dir_u + 0.78 * pull_s * glow_u) + 0.7 * u850 + jitter_a * 4.2;
+                    ag.vel_v_mps = airspeed * ((1.0 - 0.55 * pull_s) * dir_v + 0.78 * pull_s * glow_v) + 0.7 * v850 + jitter_b * 4.2;
                     let target_canopy = 85.0 + 115.0 * (1.0 - pull_s);
                     ag.alt_agl_m = clamp(0.68 * ag.alt_agl_m + 0.32 * target_canopy + jitter_a * 24.0, 28.0, 320.0);
                     ag.energy = max(ag.energy - 0.025 * sim.dt_hours, 0.04);
@@ -307,14 +359,15 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         ag.alt_agl_m = clamp(ag.alt_agl_m + 240.0 * max(sim.dt_hours, 0.2) + jitter_a * 65.0, 1850.0, 3850.0);
                         ag.energy = max(ag.energy - 0.026 * sim.dt_hours, 0.04);
                     } else {
-                        let radar_agl = clamp(sim.radar_peak_alt_m - 140.0, 380.0, 1950.0);
-                        let free_agl = clamp(ag.alt_agl_m + jitter_a * 60.0, 380.0, 1950.0);
+                        let radar_agl = clamp(sim.radar_peak_alt_m - 120.0, 720.0, 3200.0);
+                        let free_agl = clamp(ag.alt_agl_m + jitter_a * 65.0, 800.0, 3500.0);
                         let nw = clamp(sim.radar_nudge_weight, 0.0, 1.0) * 0.22;
                         ag.alt_agl_m = (1.0 - nw) * free_agl + nw * radar_agl;
                         ag.energy = max(ag.energy - 0.018 * sim.dt_hours, 0.05);
                     }
                 }
             } else {
+                ag.flags = ag.flags | 16u;
                 if ((total_precip >= 2.2) || smoke_halt) {
                     ag.flags = ag.flags | 1u;
                 } else {
@@ -329,26 +382,27 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let dl_y = att.lat - ag.lat;
                         let dl_x = att.lon - ag.lon;
                         let dist2 = dl_x * dl_x + dl_y * dl_y;
-                        if (dist2 < best_d2 && dist2 > 1e-7) {
+                        if (dist2 < best_d2) {
                             best_d2 = dist2;
-                            let inv_l = 1.0 / sqrt(dist2);
-                            pull_u = dl_x * inv_l;
-                            pull_v = dl_y * inv_l;
+                            let steer = halo_steer(dl_y, dl_x, halo_deg, halo_spin);
+                            pull_u = steer.x;
+                            pull_v = steer.y;
                         }
                     }
                 }
-                ag.vel_u_mps = pull_u * 2.6 + jitter_a * 0.85;
-                ag.vel_v_mps = pull_v * 2.6 + jitter_b * 0.85;
+                ag.vel_u_mps = pull_u * 2.2 + 0.35 * dir_u + jitter_a * 0.85;
+                ag.vel_v_mps = pull_v * 2.2 + 0.35 * dir_v + jitter_b * 0.85;
                 ag.alt_agl_m = clamp(ag.alt_agl_m * 0.74, 15.0, 140.0);
                 ag.energy = min(ag.energy + 0.048 * refueling_mult * sim.dt_hours, 1.0);
             }
         } else if (ag.taxon == 1u) {
-            ag.flags = ag.flags & (~2u);
-            if ((is_nocturnal || is_dusk) && (temp_2m > 7.5)) {
+            ag.flags = ag.flags & (~18u);
+            if ((bat_drive > 0.22) && (temp_2m > 7.5)) {
                 var pulse_boost = 0.55;
                 if (ws80 < 6.8) {
                     pulse_boost = 1.35;
                 }
+                pulse_boost = pulse_boost * (0.45 + 0.55 * bat_drive);
                 var smoke_supp = 1.0;
                 if (pm25_local >= 160.0) {
                     smoke_supp = 0.62;
@@ -356,7 +410,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let airspeed = 6.8 * pulse_boost * smoke_supp * sim.enkf_gain;
                 ag.vel_u_mps = airspeed * dir_u + 0.45 * u80 + jitter_a * 1.9;
                 ag.vel_v_mps = airspeed * dir_v + 0.45 * v80 + jitter_b * 1.9;
-                ag.alt_agl_m = clamp(ag.alt_agl_m + jitter_b * 30.0, 38.0, 340.0);
+                ag.alt_agl_m = clamp(ag.alt_agl_m + jitter_b * 30.0, 40.0, 300.0);
 
                 for (var t_i: u32 = 0u; t_i < sim.num_turbines; t_i = t_i + 1u) {
                     let tb = turbines[t_i];
@@ -378,11 +432,13 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
             } else {
-                ag.vel_u_mps = jitter_a * 0.25;
-                ag.vel_v_mps = jitter_b * 0.25;
-                ag.alt_agl_m = clamp(ag.alt_agl_m * 0.65, 8.0, 35.0);
+                ag.flags = ag.flags | 16u;
+                ag.vel_u_mps = 0.45 * dir_u + jitter_a * 0.65;
+                ag.vel_v_mps = 0.45 * dir_v + jitter_b * 0.65;
+                ag.alt_agl_m = clamp(ag.alt_agl_m * 0.65, 12.0, 42.0);
             }
         } else {
+            ag.flags = ag.flags & (~16u);
             let gdd_hr = max(temp_2m - 11.5, 0.0) / 24.0;
             ag.gdd_accum = ag.gdd_accum + gdd_hr * sim.dt_hours;
             if (ag.gdd_accum >= 352.0) {
@@ -390,33 +446,34 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 ag.generation = (ag.generation % 4u) + 1u;
             }
 
-            if ((!is_nocturnal) && (temp_2m >= 12.5) && (temp_2m <= 35.5) && (pm25_local < 220.0)) {
-                var best_score = 1e9;
-                var mw_u = 0.0;
-                var mw_v = 0.0;
-                for (var m_i: u32 = 0u; m_i < sim.num_attractors; m_i = m_i + 1u) {
-                    let patch_item = attractors[m_i];
-                    if (patch_item.kind == 1u) {
-                        let dl_y = patch_item.lat - ag.lat;
-                        let dl_x = patch_item.lon - ag.lon;
-                        let d2 = max(dl_x * dl_x + dl_y * dl_y, 1e-6);
-                        let score = d2 / max(patch_item.weight, 0.5);
-                        if (score < best_score) {
-                            best_score = score;
-                            let inv_l = 1.0 / sqrt(d2);
-                            mw_u = dl_x * inv_l;
-                            mw_v = dl_y * inv_l;
-                        }
+            var best_score = 1e9;
+            var mw_u = 0.0;
+            var mw_v = 0.0;
+            for (var m_i: u32 = 0u; m_i < sim.num_attractors; m_i = m_i + 1u) {
+                let patch_item = attractors[m_i];
+                if (patch_item.kind == 1u) {
+                    let dl_y = patch_item.lat - ag.lat;
+                    let dl_x = patch_item.lon - ag.lon;
+                    let d2 = max(dl_x * dl_x + dl_y * dl_y, 1e-6);
+                    let score = d2 / max(patch_item.weight, 0.5);
+                    if (score < best_score) {
+                        best_score = score;
+                        let steer = halo_steer(dl_y, dl_x, halo_deg, halo_spin);
+                        mw_u = steer.x;
+                        mw_v = steer.y;
                     }
                 }
-                let airspeed = 4.2 * sim.enkf_gain;
-                ag.vel_u_mps = airspeed * (0.65 * dir_u + 0.35 * mw_u) + 0.30 * u80 + jitter_a * 1.4;
-                ag.vel_v_mps = airspeed * (0.65 * dir_v + 0.35 * mw_v) + 0.30 * v80 + jitter_b * 1.4;
-                ag.alt_agl_m = clamp(18.0 + (temp_2m - 12.0) * 4.5 + jitter_a * 18.0, 5.0, 145.0);
+            }
+            if ((diurnal_drive > 0.22) && (temp_2m >= 12.5) && (temp_2m <= 35.5) && (pm25_local < 220.0)) {
+                let airspeed = 4.2 * sim.enkf_gain * (0.42 + 0.58 * diurnal_drive);
+                ag.vel_u_mps = airspeed * (0.68 * dir_u + 0.32 * mw_u) + 0.30 * u80 + jitter_a * 1.4;
+                ag.vel_v_mps = airspeed * (0.68 * dir_v + 0.32 * mw_v) + 0.30 * v80 + jitter_b * 1.4;
+                ag.alt_agl_m = clamp(14.0 + (temp_2m - 12.0) * 4.2 + jitter_a * 16.0, 5.0, 120.0);
             } else {
-                ag.vel_u_mps = 0.0;
-                ag.vel_v_mps = 0.0;
-                ag.alt_agl_m = 4.0;
+                ag.flags = ag.flags | 16u;
+                ag.vel_u_mps = 0.85 * mw_u + 0.45 * dir_u + jitter_a * 0.45;
+                ag.vel_v_mps = 0.85 * mw_v + 0.45 * dir_v + jitter_b * 0.45;
+                ag.alt_agl_m = 5.0;
             }
         }
 

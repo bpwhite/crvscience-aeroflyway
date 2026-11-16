@@ -40,12 +40,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const MAX_GPU_AGENTS: u32 = 100_000;
-pub const DEFAULT_GPU_AGENTS: u32 = 65_536;
+pub const DEFAULT_GPU_AGENTS: u32 = 2_560;
 const MAX_WEATHER_NODES: usize = 16;
 const MAX_TURBINES: usize = 512;
 const MAX_ATTRACTORS: usize = 256;
 
-/// 40-scalar (`160-byte`, 10 x `vec4`) uniform block shared identically across `compute.wgsl`,
+/// 44-scalar (`176-byte`, 11 x `vec4`) uniform block shared identically across `compute.wgsl`,
 /// `map_render.wgsl`, and `transect_render.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -99,6 +99,11 @@ pub struct GpuSimUniforms {
     pub radar_peak_alt_m: f32,
     pub radar_nudge_weight: f32,
     pub skyglow_intensity_mult: f32,
+
+    pub cam_pitch_rad: f32,
+    pub cam_bearing_rad: f32,
+    pub cam_alt_exag: f32,
+    pub _cam_pad: f32,
 }
 
 #[repr(C)]
@@ -664,6 +669,9 @@ pub fn pack_gpu_uniforms(
     center_lat: f64,
     center_lon: f64,
     zoom: f64,
+    pitch_deg: f64,
+    bearing_deg: f64,
+    alt_exaggeration: f64,
     canvas_w_pts: f32,
     canvas_h_pts: f32,
     dt_hours: f64,
@@ -763,6 +771,10 @@ pub fn pack_gpu_uniforms(
         radar_peak_alt_m: radar_peak_alt_m as f32,
         radar_nudge_weight: params.radar_nudge_weight as f32,
         skyglow_intensity_mult: params.skyglow_intensity_mult as f32,
+        cam_pitch_rad: pitch_deg.clamp(0.0, 62.0).to_radians() as f32,
+        cam_bearing_rad: bearing_deg.to_radians() as f32,
+        cam_alt_exag: alt_exaggeration.max(0.0) as f32,
+        _cam_pad: 0.0,
     }
 }
 

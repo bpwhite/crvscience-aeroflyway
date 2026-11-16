@@ -87,10 +87,21 @@ struct DecodedTile {
     rgba: Vec<u8>,
 }
 
+pub struct ProjectedTile {
+    pub min_wx: f64,
+    pub min_wy: f64,
+    pub max_wx: f64,
+    pub max_wy: f64,
+    pub texture: TextureHandle,
+}
+
 pub struct MapViewport {
     pub center_lat: f64,
     pub center_lon: f64,
     pub zoom: f64,
+    pub pitch_deg: f64,
+    pub bearing_deg: f64,
+    pub alt_exaggeration: f64,
     pub provider: BasemapProvider,
     textures: HashMap<TileKey, TextureHandle>,
     in_flight: HashSet<TileKey>,
@@ -111,6 +122,9 @@ impl MapViewport {
             center_lat: 44.48,
             center_lon: -122.95,
             zoom: 6.4,
+            pitch_deg: 42.0,
+            bearing_deg: -18.0,
+            alt_exaggeration: 1.0,
             provider: BasemapProvider::VectorDarkOffline,
             textures: HashMap::new(),
             in_flight: HashSet::new(),
@@ -118,6 +132,31 @@ impl MapViewport {
             req_tx,
             resp_rx,
         }
+    }
+
+    pub fn is_25d(&self) -> bool {
+        self.pitch_deg > 1.0 || self.bearing_deg.abs() > 1.0
+    }
+
+    pub fn toggle_25d(&mut self) {
+        if self.is_25d() {
+            self.pitch_deg = 0.0;
+            self.bearing_deg = 0.0;
+        } else {
+            self.pitch_deg = 42.0;
+            self.bearing_deg = -18.0;
+        }
+    }
+
+    pub fn wrap_bearing(deg: f64) -> f64 {
+        let mut d = deg;
+        while d > 180.0 {
+            d -= 360.0;
+        }
+        while d < -180.0 {
+            d += 360.0;
+        }
+        d
     }
 
     pub fn jump_to(&mut self, lat: f64, lon: f64, zoom: f64) {
@@ -146,32 +185,102 @@ impl MapViewport {
         (lat, lon)
     }
 
-    /// Converts `(lat, lon)` into screen `Pos2` inside `canvas_rect`.
-    pub fn lat_lon_to_screen(&self, lat: f64, lon: f64, canvas_rect: Rect) -> Pos2 {
-        let (cx, cy) = Self::lat_lon_to_world_px(self.center_lat, self.center_lon, self.zoom);
-        let (wx, wy) = Self::lat_lon_to_world_px(lat, lon, self.zoom);
-        let center_screen = canvas_rect.center();
-        Pos2::new(
-            center_screen.x + (wx - cx) as f32,
-            center_screen.y + (wy - cy) as f32,
-        )
+    #[inline]
+    fn camera_depth_px(canvas_rect: Rect) -> f64 {
+        (canvas_rect.height() as f64 * 1.15).max(680.0)
     }
 
-    /// Converts screen `Pos2` inside `canvas_rect` to geographic `(lat, lon)`.
+    #[inline]
+    fn project_delta_px(&self, dx: f64, dy: f64, alt_agl_m: f64, canvas_rect: Rect) -> (Pos2, f32) {
+        let b = self.bearing_deg.to_radians();
+        let p = self.pitch_deg.clamp(0.0, 62.0).to_radians();
+        let ge = dx;
+        let gn = -dy;
+        let rx = ge * b.cos() - gn * b.sin();
+        let fy = ge * b.sin() + gn * b.cos();
+        let elev_z = (alt_agl_m / 36.0) * self.alt_exaggeration.max(0.0);
+        let cam_d = Self::camera_depth_px(canvas_rect);
+        let depth = fy * p.sin() - elev_z * p.cos();
+        let denom = (cam_d + depth).max(cam_d * 0.22);
+        let persp = cam_d / denom;
+        let center_screen = canvas_rect.center();
+        let sx = center_screen.x + (rx * persp) as f32;
+        let sy = center_screen.y - ((fy * p.cos() + elev_z * p.sin()) * persp) as f32;
+        (Pos2::new(sx, sy), persp as f32)
+    }
+
+    /// Projects geographic `(lat, lon, alt_agl_m)` into 2.5D perspective screen coordinates and foreshortening scale.
+    pub fn project_ground_with_scale(
+        &self,
+        lat: f64,
+        lon: f64,
+        alt_agl_m: f64,
+        canvas_rect: Rect,
+    ) -> (Pos2, f32) {
+        let scale = TILE_SIZE * 2.0_f64.powf(self.zoom);
+        let dlon = wrap_lon(lon - self.center_lon);
+        let dx = (dlon / 360.0) * scale;
+        let (_, cy) = Self::lat_lon_to_world_px(self.center_lat, self.center_lon, self.zoom);
+        let (_, wy) = Self::lat_lon_to_world_px(lat, lon, self.zoom);
+        let dy = wy - cy;
+        self.project_delta_px(dx, dy, alt_agl_m, canvas_rect)
+    }
+
+    /// Projects raw Web Mercator world pixel coordinates `(wx, wy)` + `alt_agl_m` into 2.5D screen space.
+    pub fn project_world_px(
+        &self,
+        wx: f64,
+        wy: f64,
+        alt_agl_m: f64,
+        canvas_rect: Rect,
+    ) -> (Pos2, f32) {
+        let (cx, cy) = Self::lat_lon_to_world_px(self.center_lat, self.center_lon, self.zoom);
+        self.project_delta_px(wx - cx, wy - cy, alt_agl_m, canvas_rect)
+    }
+
+    /// Converts `(lat, lon)` on the ground plane (`alt_agl_m = 0`) into screen `Pos2` inside `canvas_rect`.
+    pub fn lat_lon_to_screen(&self, lat: f64, lon: f64, canvas_rect: Rect) -> Pos2 {
+        self.project_ground_with_scale(lat, lon, 0.0, canvas_rect).0
+    }
+
+    #[inline]
+    fn screen_to_world_delta(&self, pos: Pos2, canvas_rect: Rect) -> (f64, f64) {
+        let b = self.bearing_deg.to_radians();
+        let p = self.pitch_deg.clamp(0.0, 62.0).to_radians();
+        let cam_d = Self::camera_depth_px(canvas_rect);
+        let center_screen = canvas_rect.center();
+        let ux = (pos.x - center_screen.x) as f64;
+        let uy_up = -(pos.y - center_screen.y) as f64;
+        let fy = (uy_up * cam_d) / (p.cos() * cam_d - uy_up * p.sin()).max(cam_d * 0.15);
+        let denom = (cam_d + fy * p.sin()).max(cam_d * 0.22);
+        let persp = cam_d / denom;
+        let rx = ux / persp;
+        let dx = rx * b.cos() + fy * b.sin();
+        let gn = -rx * b.sin() + fy * b.cos();
+        (dx, -gn)
+    }
+
+    /// Converts screen `Pos2` inside `canvas_rect` to geographic `(lat, lon)` on the ground plane.
     pub fn screen_to_lat_lon(&self, pos: Pos2, canvas_rect: Rect) -> (f64, f64) {
         let (cx, cy) = Self::lat_lon_to_world_px(self.center_lat, self.center_lon, self.zoom);
-        let center_screen = canvas_rect.center();
-        let wx = cx + (pos.x - center_screen.x) as f64;
-        let wy = cy + (pos.y - center_screen.y) as f64;
+        let (dx, dy) = self.screen_to_world_delta(pos, canvas_rect);
+        let wx = cx + dx;
+        let wy = cy + dy;
         Self::world_px_to_lat_lon(wx, wy, self.zoom)
     }
 
-    /// Pans map by screen drag delta `delta_px`.
+    /// Pans map by screen drag delta `delta_px`, compensating for current bearing and pitch tilt.
     pub fn pan_by_pixels(&mut self, delta_px: Vec2) {
+        let b = self.bearing_deg.to_radians();
+        let p = self.pitch_deg.clamp(0.0, 62.0).to_radians();
         let (cx, cy) = Self::lat_lon_to_world_px(self.center_lat, self.center_lon, self.zoom);
         let max_world = TILE_SIZE * 2.0_f64.powf(self.zoom);
-        let nx = cx - delta_px.x as f64;
-        let ny = (cy - delta_px.y as f64).clamp(0.0, max_world);
+        let d_rx = delta_px.x as f64;
+        let d_fy = -(delta_px.y as f64) / p.cos().max(0.32);
+        let d_dx = d_rx * b.cos() + d_fy * b.sin();
+        let d_dy = -(-d_rx * b.sin() + d_fy * b.cos());
+        let nx = cx - d_dx;
+        let ny = (cy - d_dy).clamp(0.0, max_world);
         let (lat, lon) = Self::world_px_to_lat_lon(nx, ny, self.zoom);
         self.center_lat = lat;
         self.center_lon = lon;
@@ -187,12 +296,10 @@ impl MapViewport {
         self.zoom = new_zoom;
 
         let (ax, ay) = Self::lat_lon_to_world_px(anchor_lat, anchor_lon, self.zoom);
-        let center_screen = canvas_rect.center();
-        let offset_x = (anchor_screen.x - center_screen.x) as f64;
-        let offset_y = (anchor_screen.y - center_screen.y) as f64;
-        let new_cx = ax - offset_x;
+        let (dx_off, dy_off) = self.screen_to_world_delta(anchor_screen, canvas_rect);
+        let new_cx = ax - dx_off;
         let max_world = TILE_SIZE * 2.0_f64.powf(self.zoom);
-        let new_cy = (ay - offset_y).clamp(0.0, max_world);
+        let new_cy = (ay - dy_off).clamp(0.0, max_world);
         let (lat, lon) = Self::world_px_to_lat_lon(new_cx, new_cy, self.zoom);
         self.center_lat = lat;
         self.center_lon = lon;
@@ -204,12 +311,12 @@ impl MapViewport {
         (2.0 * PI * EARTH_RADIUS_M * cos_lat) / (TILE_SIZE * 2.0_f64.powf(self.zoom))
     }
 
-    /// Polls decoded tiles from worker thread and returns visible `(Rect, TextureHandle)` pairs.
-    pub fn visible_raster_tiles(
+    /// Polls decoded tiles from worker thread and returns visible projected world-space tiles for 2.5D warping.
+    pub fn visible_world_tiles(
         &mut self,
         ctx: &Context,
         canvas_rect: Rect,
-    ) -> Vec<(Rect, TextureHandle)> {
+    ) -> Vec<ProjectedTile> {
         while let Ok(msg) = self.resp_rx.try_recv() {
             if let Some((key, decoded)) = msg {
                 self.in_flight.remove(&key);
@@ -217,7 +324,6 @@ impl MapViewport {
                     self.failed.insert(key);
                 } else {
                     if self.textures.len() > 320 {
-                        // Simple eviction to bound GPU texture cache
                         if let Some(first_key) = self.textures.keys().next().copied() {
                             self.textures.remove(&first_key);
                         }
@@ -246,20 +352,34 @@ impl MapViewport {
         let tile_z = (self.zoom.floor() as u32).clamp(3, 14);
         let n_tiles = 1_u32 << tile_z;
         let sub_scale = 2.0_f64.powf(self.zoom - tile_z as f64);
-        let scaled_tile_px = (TILE_SIZE * sub_scale) as f32;
+        let denom = TILE_SIZE * sub_scale;
 
         let (cx_z, cy_z) = Self::lat_lon_to_world_px(self.center_lat, self.center_lon, self.zoom);
-        let center_screen = canvas_rect.center();
-        let world_left = cx_z - (canvas_rect.width() as f64) * 0.5;
-        let world_right = cx_z + (canvas_rect.width() as f64) * 0.5;
-        let world_top = cy_z - (canvas_rect.height() as f64) * 0.5;
-        let world_bottom = cy_z + (canvas_rect.height() as f64) * 0.5;
+        let mut world_left = cx_z - (canvas_rect.width() as f64) * 0.6;
+        let mut world_right = cx_z + (canvas_rect.width() as f64) * 0.6;
+        let mut world_top = cy_z - (canvas_rect.height() as f64) * 0.6;
+        let mut world_bottom = cy_z + (canvas_rect.height() as f64) * 0.6;
 
-        let denom = TILE_SIZE * sub_scale;
-        let min_tx = (world_left / denom).floor() as i32;
-        let max_tx = (world_right / denom).floor() as i32;
-        let min_ty = (world_top / denom).floor().max(0.0) as i32;
-        let max_ty = (world_bottom / denom).floor().min((n_tiles as f64) - 1.0) as i32;
+        for sy_frac in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            for sx_frac in [0.0_f32, 0.5, 1.0] {
+                let p = Pos2::new(
+                    canvas_rect.left() + canvas_rect.width() * sx_frac,
+                    canvas_rect.top() + canvas_rect.height() * sy_frac,
+                );
+                let (dx, dy) = self.screen_to_world_delta(p, canvas_rect);
+                world_left = world_left.min(cx_z + dx);
+                world_right = world_right.max(cx_z + dx);
+                world_top = world_top.min(cy_z + dy);
+                world_bottom = world_bottom.max(cy_z + dy);
+            }
+        }
+
+        let center_tx = (cx_z / denom).floor() as i32;
+        let center_ty = (cy_z / denom).floor() as i32;
+        let min_tx = ((world_left / denom).floor() as i32).max(center_tx - 5);
+        let max_tx = ((world_right / denom).floor() as i32).min(center_tx + 5);
+        let min_ty = ((world_top / denom).floor() as i32).clamp(0, (n_tiles as i32) - 1).max(center_ty - 5);
+        let max_ty = ((world_bottom / denom).floor() as i32).clamp(0, (n_tiles as i32) - 1).min(center_ty + 5);
 
         let mut visible = Vec::new();
         for ty in min_ty..=max_ty {
@@ -274,16 +394,14 @@ impl MapViewport {
                     x: wrapped_tx,
                     y: ty as u32,
                 };
-
-                let screen_x = center_screen.x + ((tx as f64) * denom - cx_z) as f32;
-                let screen_y = center_screen.y + ((ty as f64) * denom - cy_z) as f32;
-                let rect = Rect::from_min_size(
-                    Pos2::new(screen_x, screen_y),
-                    Vec2::new(scaled_tile_px + 0.5, scaled_tile_px + 0.5),
-                );
-
                 if let Some(tex) = self.textures.get(&key) {
-                    visible.push((rect, tex.clone()));
+                    visible.push(ProjectedTile {
+                        min_wx: (tx as f64) * denom,
+                        min_wy: (ty as f64) * denom,
+                        max_wx: ((tx + 1) as f64) * denom,
+                        max_wy: ((ty + 1) as f64) * denom,
+                        texture: tex.clone(),
+                    });
                 } else if !self.in_flight.contains(&key)
                     && !self.failed.contains(&key)
                     && self.in_flight.len() < 24
@@ -294,6 +412,22 @@ impl MapViewport {
             }
         }
         visible
+    }
+
+    /// Flat 2D compatibility wrapper returning unwarped screen rectangles.
+    pub fn visible_raster_tiles(
+        &mut self,
+        ctx: &Context,
+        canvas_rect: Rect,
+    ) -> Vec<(Rect, TextureHandle)> {
+        self.visible_world_tiles(ctx, canvas_rect)
+            .into_iter()
+            .map(|t| {
+                let p0 = self.project_world_px(t.min_wx, t.min_wy, 0.0, canvas_rect).0;
+                let p1 = self.project_world_px(t.max_wx, t.max_wy, 0.0, canvas_rect).0;
+                (Rect::from_two_pos(p0, p1), t.texture)
+            })
+            .collect()
     }
 
     pub fn retry_failed_tiles(&mut self) {

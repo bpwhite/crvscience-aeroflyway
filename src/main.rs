@@ -107,7 +107,7 @@ impl Default for LayerToggles {
             observations: true,
             turbines: true,
             milkweed: true,
-            hex_heatmap: true,
+            hex_heatmap: false,
             wind_barbs: true,
             landmarks: true,
         }
@@ -1090,13 +1090,28 @@ impl AeroFlywayApp {
                 if self.gpu_available {
                     ui.separator();
                     let badge = if self.use_gpu_compute {
-                        format!("WGSL GPU ({}k)", self.gpu_agent_count / 1000)
+                        if self.gpu_agent_count >= 1000 {
+                            format!("WGSL GPU ({:.1}k)", self.gpu_agent_count as f32 / 1000.0)
+                        } else {
+                            format!("WGSL GPU ({})", self.gpu_agent_count)
+                        }
                     } else {
-                        "CPU Rayon (2.4k)".to_string()
+                        format!("CPU Rayon ({})", self.engine.agents.len())
                     };
                     if ui.selectable_label(self.use_gpu_compute, badge).clicked() {
                         self.use_gpu_compute = !self.use_gpu_compute;
                     }
+                }
+
+                ui.separator();
+                let is_25d = self.map.is_25d();
+                let cam_lbl = if is_25d {
+                    format!("2D / 2.5D ({:.0}°)", self.map.pitch_deg)
+                } else {
+                    "2D / 2.5D (2D)".to_string()
+                };
+                if ui.selectable_label(is_25d, cam_lbl).clicked() {
+                    self.map.toggle_25d();
                 }
 
                 ui.separator();
@@ -1338,11 +1353,43 @@ impl AeroFlywayApp {
                         ui.add_space(5.0);
                         ui.label("GPU Instanced Swarm Size (VRAM Zero-Copy)");
                         ui.add(
-                            egui::Slider::new(&mut self.gpu_agent_count, 2_048..=MAX_GPU_AGENTS)
-                                .step_by(1024.0)
+                            egui::Slider::new(&mut self.gpu_agent_count, 512..=MAX_GPU_AGENTS)
+                                .step_by(256.0)
                                 .suffix(" agents"),
                         );
                     }
+
+                    ui.add_space(5.0);
+                    ui.separator();
+                    ui.heading("2.5D Oblique Camera (Right-Drag Map)");
+                    ui.add(
+                        egui::Slider::new(&mut self.map.pitch_deg, 0.0..=62.0)
+                            .prefix("Pitch ")
+                            .suffix(" deg")
+                            .fixed_decimals(0),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.map.bearing_deg, -180.0..=180.0)
+                            .prefix("Bearing ")
+                            .suffix(" deg")
+                            .fixed_decimals(0),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.map.alt_exaggeration, 0.0..=2.5)
+                            .prefix("Alt Exag ")
+                            .suffix("x")
+                            .fixed_decimals(2),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("2.5D Oblique").clicked() {
+                            self.map.pitch_deg = 42.0;
+                            self.map.bearing_deg = -18.0;
+                        }
+                        if ui.button("2D Plan").clicked() {
+                            self.map.pitch_deg = 0.0;
+                            self.map.bearing_deg = 0.0;
+                        }
+                    });
 
                     ui.add_space(6.0);
                     ui.separator();
@@ -2178,6 +2225,14 @@ impl AeroFlywayApp {
                 }
             }
 
+            if response.dragged_by(egui::PointerButton::Secondary) {
+                let delta = response.drag_delta();
+                self.map.bearing_deg =
+                    MapViewport::wrap_bearing(self.map.bearing_deg + delta.x as f64 * 0.35);
+                self.map.pitch_deg =
+                    (self.map.pitch_deg - delta.y as f64 * 0.28).clamp(0.0, 62.0);
+            }
+
             match self.tool_mode {
                 MapToolMode::PanAndInspect => {
                     if response.dragged_by(egui::PointerButton::Primary) {
@@ -2223,16 +2278,40 @@ impl AeroFlywayApp {
                 }
             }
 
-            let tiles = self.map.visible_raster_tiles(ctx, canvas_rect);
-            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+            let tiles = self.map.visible_world_tiles(ctx, canvas_rect);
             let tint = match self.map.provider {
                 BasemapProvider::OpenStreetMap | BasemapProvider::UsgsNationalTopo => {
                     Color32::from_rgba_unmultiplied(185, 198, 215, 210)
                 }
                 _ => Color32::WHITE,
             };
-            for (rect, tex) in tiles {
-                painter.image(tex.id(), rect, uv, tint);
+            for tile in tiles {
+                let mut mesh = egui::epaint::Mesh::with_texture(tile.texture.id());
+                for iy in 0..=2_u32 {
+                    let v = (iy as f32) * 0.5;
+                    let wy = tile.min_wy + (tile.max_wy - tile.min_wy) * (v as f64);
+                    for ix in 0..=2_u32 {
+                        let u = (ix as f32) * 0.5;
+                        let wx = tile.min_wx + (tile.max_wx - tile.min_wx) * (u as f64);
+                        let (sp, _) = self.map.project_world_px(wx, wy, 0.0, canvas_rect);
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos: sp,
+                            uv: Pos2::new(u, v),
+                            color: tint,
+                        });
+                    }
+                }
+                for iy in 0..2_u32 {
+                    for ix in 0..2_u32 {
+                        let i0 = iy * 3 + ix;
+                        let i1 = i0 + 1;
+                        let i2 = i0 + 3;
+                        let i3 = i2 + 1;
+                        mesh.add_triangle(i0, i1, i3);
+                        mesh.add_triangle(i0, i3, i2);
+                    }
+                }
+                painter.add(egui::Shape::mesh(mesh));
             }
 
             self.paint_vector_basemap(&painter, canvas_rect);
@@ -2328,6 +2407,9 @@ impl AeroFlywayApp {
                     self.map.center_lat,
                     self.map.center_lon,
                     self.map.zoom,
+                    self.map.pitch_deg,
+                    self.map.bearing_deg,
+                    self.map.alt_exaggeration,
                     canvas_rect.width(),
                     canvas_rect.height(),
                     self.last_frame_sim_dt_hr,
@@ -2362,6 +2444,11 @@ impl AeroFlywayApp {
                     },
                 ));
             } else {
+                let heading_rad = aero_heading_rad(&self.params, self.engine.metrics.day_of_year);
+                let cb = self.map.bearing_deg.to_radians() as f32;
+                let sb = cb.sin();
+                let cb = cb.cos();
+                let cp = (self.map.pitch_deg.clamp(0.0, 62.0).to_radians() as f32).cos();
                 for agent in &self.engine.agents {
                     let enabled = match agent.taxon {
                         Taxon::Bird => self.layers.birds,
@@ -2371,19 +2458,54 @@ impl AeroFlywayApp {
                     if !enabled {
                         continue;
                     }
-                    let sp = self.map.lat_lon_to_screen(agent.lat, agent.lon, canvas_rect);
-                    if !canvas_rect.expand(20.0).contains(sp) {
+                    let (ground_sp, _) =
+                        self.map
+                            .project_ground_with_scale(agent.lat, agent.lon, 0.0, canvas_rect);
+                    let (sp, persp) = self.map.project_ground_with_scale(
+                        agent.lat,
+                        agent.lon,
+                        agent.alt_agl_m,
+                        canvas_rect,
+                    );
+                    if !canvas_rect.expand(36.0).contains(sp) {
                         continue;
                     }
-                    let radius = if agent.in_fallout_stopover { 3.2 } else { 2.2 };
-                    let fill_col = if agent.taxon == Taxon::Bird && agent.skyglow_entrained {
-                        Color32::from_rgba_unmultiplied(244, 114, 182, 235)
-                    } else if agent.smoke_disrupted && agent.taxon == Taxon::Bird {
-                        Color32::from_rgba_unmultiplied(249, 115, 22, 235)
+                    if self.map.pitch_deg > 2.0 && (sp.y - ground_sp.y).abs() > 3.0 {
+                        let stem_alpha = if agent.is_roosting { 18 } else { 42 };
+                        painter.line_segment(
+                            [ground_sp, sp],
+                            Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(148, 163, 184, stem_alpha)),
+                        );
+                        painter.circle_filled(
+                            ground_sp,
+                            1.4,
+                            Color32::from_rgba_unmultiplied(15, 23, 42, 90),
+                        );
+                    }
+
+                    let spd = agent.vel_u_mps.hypot(agent.vel_v_mps);
+                    let (vu, vv) = if spd > 0.15 {
+                        ((agent.vel_u_mps / spd) as f32, (agent.vel_v_mps / spd) as f32)
                     } else {
-                        taxon_color(agent.taxon, 235)
+                        (heading_rad.sin() as f32, heading_rad.cos() as f32)
                     };
-                    painter.circle_filled(sp, radius, fill_col);
+                    let rot_u = vu * cb - vv * sb;
+                    let rot_v = (vu * sb + vv * cb) * cp;
+                    let fwd = Vec2::new(rot_u, -rot_v).normalized();
+                    let right = Vec2::new(-fwd.y, fwd.x);
+
+                    let alpha = if agent.is_roosting { 56 } else { 209 }; // 0.22 vs 0.82
+                    let fill_col = if agent.taxon == Taxon::Bird && agent.skyglow_entrained {
+                        Color32::from_rgba_unmultiplied(244, 114, 182, alpha)
+                    } else if agent.smoke_disrupted && agent.taxon == Taxon::Bird {
+                        Color32::from_rgba_unmultiplied(249, 115, 22, alpha)
+                    } else {
+                        taxon_color(agent.taxon, alpha)
+                    };
+                    let size_pt = ((3.4 + (self.map.zoom as f32 - 3.5).max(0.0) * 0.36).clamp(3.3, 5.2))
+                        * persp.clamp(0.78, 1.25)
+                        * if agent.is_roosting { 0.8 } else { 1.0 };
+                    paint_taxon_silhouette(&painter, agent.taxon, sp, fwd, right, size_pt, fill_col);
                 }
             }
 
@@ -2420,6 +2542,7 @@ impl AeroFlywayApp {
             );
 
             self.paint_map_hud(&painter, canvas_rect, response.hover_pos());
+            self.paint_taxon_legend_pill(&painter, canvas_rect);
         });
     }
 
@@ -2492,15 +2615,25 @@ impl AeroFlywayApp {
 
     fn paint_vector_basemap(&self, painter: &egui::Painter, canvas_rect: Rect) {
         let graticule_stroke = Stroke::new(0.6, Color32::from_rgba_unmultiplied(51, 65, 85, 95));
-        for lat_i in (-60..=72).step_by(4) {
-            let p1 = self.map.lat_lon_to_screen(lat_i as f64, -175.0, canvas_rect);
-            let p2 = self.map.lat_lon_to_screen(lat_i as f64, 175.0, canvas_rect);
-            painter.line_segment([p1, p2], graticule_stroke);
+        let (min_lat_b, max_lat_b, min_lon_b, max_lon_b) = self.params.region.corridor_bounds();
+        let lat_lo = ((min_lat_b - 18.0).max(-64.0) / 4.0).floor() as i32 * 4;
+        let lat_hi = ((max_lat_b + 18.0).min(76.0) / 4.0).ceil() as i32 * 4;
+        let lon_lo = ((min_lon_b - 24.0).max(-176.0) / 4.0).floor() as i32 * 4;
+        let lon_hi = ((max_lon_b + 24.0).min(176.0) / 4.0).ceil() as i32 * 4;
+
+        for lat_i in (lat_lo..=lat_hi).step_by(4) {
+            let pts: Vec<Pos2> = (lon_lo..=lon_hi)
+                .step_by(2)
+                .map(|ln| self.map.lat_lon_to_screen(lat_i as f64, ln as f64, canvas_rect))
+                .collect();
+            painter.add(egui::Shape::line(pts, graticule_stroke));
         }
-        for lon_i in (-176..=176).step_by(4) {
-            let p1 = self.map.lat_lon_to_screen(-60.0, lon_i as f64, canvas_rect);
-            let p2 = self.map.lat_lon_to_screen(72.0, lon_i as f64, canvas_rect);
-            painter.line_segment([p1, p2], graticule_stroke);
+        for lon_i in (lon_lo..=lon_hi).step_by(4) {
+            let pts: Vec<Pos2> = (lat_lo..=lat_hi)
+                .step_by(2)
+                .map(|lt| self.map.lat_lon_to_screen(lt as f64, lon_i as f64, canvas_rect))
+                .collect();
+            painter.add(egui::Shape::line(pts, graticule_stroke));
         }
 
         if self.params.region == FlywayRegion::PacificAmericas {
@@ -2659,7 +2792,10 @@ impl AeroFlywayApp {
         painter.text(
             Pos2::new(bar_x0 + bar_px + 8.0, bar_y),
             Align2::LEFT_CENTER,
-            format!("{target_km:.0} km (z={:.1})", self.map.zoom),
+            format!(
+                "{target_km:.0} km (z={:.1} | P={:.0}° B={:.0}°)",
+                self.map.zoom, self.map.pitch_deg, self.map.bearing_deg
+            ),
             FontId::monospace(10.5),
             Color32::from_rgb(203, 213, 225),
         );
@@ -2683,6 +2819,67 @@ impl AeroFlywayApp {
                 ),
                 FontId::monospace(10.5),
                 Color32::from_rgb(148, 163, 184),
+            );
+        }
+    }
+
+    fn paint_taxon_legend_pill(&self, painter: &egui::Painter, canvas_rect: Rect) {
+        let pill_w = 248.0_f32;
+        let pill_h = 74.0_f32;
+        let pill_rect = Rect::from_min_size(
+            Pos2::new(
+                canvas_rect.right() - pill_w - 12.0,
+                canvas_rect.bottom() - pill_h - 12.0,
+            ),
+            Vec2::new(pill_w, pill_h),
+        );
+        painter.rect_filled(
+            pill_rect,
+            CornerRadius::same(7),
+            Color32::from_rgba_unmultiplied(15, 23, 42, 220),
+        );
+        painter.rect_stroke(
+            pill_rect,
+            CornerRadius::same(7),
+            Stroke::new(1.0_f32, Color32::from_rgb(51, 65, 85)),
+            StrokeKind::Inside,
+        );
+
+        let rows = [
+            (
+                Taxon::Bird,
+                Color32::from_rgb(56, 189, 248),
+                "Avian Streams (800-3500 m AGL)",
+            ),
+            (
+                Taxon::Bat,
+                Color32::from_rgb(192, 132, 252),
+                "Chiroptera Rotor Zone (40-300 m)",
+            ),
+            (
+                Taxon::Butterfly,
+                Color32::from_rgb(251, 146, 60),
+                "Lepidoptera Thermal (5-120 m)",
+            ),
+        ];
+        for (idx, (taxon, col, label)) in rows.iter().enumerate() {
+            let cy = pill_rect.top() + 15.0 + (idx as f32) * 21.0;
+            let icon_center = Pos2::new(pill_rect.left() + 18.0, cy);
+            paint_taxon_silhouette(
+                painter,
+                *taxon,
+                icon_center,
+                Vec2::new(0.0, -1.0),
+                Vec2::new(1.0, 0.0),
+                6.2,
+                *col,
+            );
+            painter.text(
+                Pos2::new(pill_rect.left() + 31.0, cy),
+                Align2::LEFT_CENTER,
+                *label,
+                FontId::proportional(11.0),
+                Color32::from_rgb(226, 232, 240),
             );
         }
     }
@@ -2761,7 +2958,112 @@ fn taxon_color(taxon: Taxon, alpha: u8) -> Color32 {
     match taxon {
         Taxon::Bird => Color32::from_rgba_unmultiplied(56, 189, 248, alpha),
         Taxon::Bat => Color32::from_rgba_unmultiplied(192, 132, 252, alpha),
-        Taxon::Butterfly => Color32::from_rgba_unmultiplied(251, 191, 36, alpha),
+        Taxon::Butterfly => Color32::from_rgba_unmultiplied(251, 146, 60, alpha),
+    }
+}
+
+fn aero_heading_rad(params: &SimulationParams, active_doy: f64) -> f64 {
+    aeroflyway::physics::annual_flyway_heading_deg(params.region, active_doy).to_radians()
+}
+
+fn paint_taxon_silhouette(
+    painter: &egui::Painter,
+    taxon: Taxon,
+    center: Pos2,
+    fwd: Vec2,
+    right: Vec2,
+    half_px: f32,
+    color: Color32,
+) {
+    let pt = |u: f32, v: f32| -> Pos2 { center + right * (u * half_px) + fwd * (v * half_px) };
+    match taxon {
+        Taxon::Bird => {
+            // Swept chevron wing + forked swallow tail
+            let pts = vec![
+                pt(0.0, 0.92),
+                pt(0.20, 0.25),
+                pt(0.95, -0.35),
+                pt(0.55, -0.45),
+                pt(0.14, -0.15),
+                pt(0.28, -0.88),
+                pt(0.0, -0.52),
+                pt(-0.28, -0.88),
+                pt(-0.14, -0.15),
+                pt(-0.55, -0.45),
+                pt(-0.95, -0.35),
+                pt(-0.20, 0.25),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                vec![pt(0.0, 0.92), pt(0.95, -0.35), pt(0.0, -0.18), pt(-0.95, -0.35)],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(egui::Shape::line(
+                pts,
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), color.a())),
+            ));
+        }
+        Taxon::Bat => {
+            // Twin ears + 3 scalloped trailing cutouts
+            let wing_pts = vec![
+                pt(0.0, 0.42),
+                pt(0.16, 0.78),
+                pt(0.26, 0.34),
+                pt(0.94, 0.14),
+                pt(0.72, -0.30),
+                pt(0.52, -0.12),
+                pt(0.32, -0.34),
+                pt(0.14, -0.14),
+                pt(0.0, -0.48),
+                pt(-0.14, -0.14),
+                pt(-0.32, -0.34),
+                pt(-0.52, -0.12),
+                pt(-0.72, -0.30),
+                pt(-0.94, 0.14),
+                pt(-0.26, 0.34),
+                pt(-0.16, 0.78),
+                pt(0.0, 0.42),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                vec![pt(0.0, 0.50), pt(0.92, 0.12), pt(0.0, -0.42), pt(-0.92, 0.12)],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(egui::Shape::line(wing_pts, Stroke::new(1.1_f32, color)));
+        }
+        Taxon::Butterfly => {
+            // 4-lobed forewing/hindwing butterfly + thorax
+            let fore_l = vec![
+                pt(0.06, 0.18),
+                pt(0.45, 0.72),
+                pt(0.92, 0.46),
+                pt(0.84, 0.06),
+                pt(0.12, -0.02),
+            ];
+            let fore_r = vec![
+                pt(-0.06, 0.18),
+                pt(-0.12, -0.02),
+                pt(-0.84, 0.06),
+                pt(-0.92, 0.46),
+                pt(-0.45, 0.72),
+            ];
+            let hind_l = vec![
+                pt(0.08, -0.04),
+                pt(0.70, -0.14),
+                pt(0.56, -0.68),
+                pt(0.14, -0.58),
+            ];
+            let hind_r = vec![
+                pt(-0.08, -0.04),
+                pt(-0.14, -0.58),
+                pt(-0.56, -0.68),
+                pt(-0.70, -0.14),
+            ];
+            for lobe in [fore_l, fore_r, hind_l, hind_r] {
+                painter.add(egui::Shape::convex_polygon(lobe, color, Stroke::NONE));
+            }
+            painter.line_segment([pt(0.0, -0.64), pt(0.0, 0.62)], Stroke::new(1.4_f32, color));
+        }
     }
 }
 
@@ -2835,7 +3137,7 @@ fn run_headless_screenshot(out_path: &std::path::Path, view: u8) -> Result<(), S
     let ctx = egui::Context::default();
     let mut app = AeroFlywayApp::new_with_wgpu(&ctx, Some(&render_state), temp_db.clone(), true);
     app.campaign_db_path_input = "aeroflyway.db".to_string();
-    app.gpu_agent_count = 3072;
+    app.gpu_agent_count = DEFAULT_GPU_AGENTS;
     app.sim_speed_hr_per_sec = 6.0;
     app.map.zoom = 5.95;
     app.engine.step(

@@ -245,6 +245,7 @@ pub struct FlywayAgent {
     pub in_fallout_stopover: bool,
     pub smoke_disrupted: bool,
     pub skyglow_entrained: bool,
+    pub is_roosting: bool,
     pub trail: Vec<(f64, f64)>,
 }
 
@@ -312,7 +313,7 @@ impl AeroPhysicsEngine {
         let (mean_mtr, peak_alt) = summarize_radar_corridor(&radar_profiles);
 
         let mut engine = Self {
-            agents: Vec::with_capacity(2400),
+            agents: Vec::with_capacity(480),
             weather_nodes,
             radar_profiles,
             cached_transect_dem: None,
@@ -348,7 +349,7 @@ impl AeroPhysicsEngine {
 
         let mut id = 0_u32;
 
-        for i in 0..1000 {
+        for i in 0..220 {
             let h1 = deterministic_unit(i as u64 * 31 + 7);
             let h2 = deterministic_unit(i as u64 * 67 + 13);
             let h3 = deterministic_unit(i as u64 * 101 + 29);
@@ -378,12 +379,13 @@ impl AeroPhysicsEngine {
                 in_fallout_stopover: false,
                 smoke_disrupted: false,
                 skyglow_entrained: false,
+                is_roosting: false,
                 trail: vec![(lat, lon)],
             });
             id += 1;
         }
 
-        for i in 0..700 {
+        for i in 0..140 {
             let h1 = deterministic_unit(i as u64 * 43 + 1009);
             let h2 = deterministic_unit(i as u64 * 89 + 2017);
             let h3 = deterministic_unit(i as u64 * 127 + 3001);
@@ -406,12 +408,13 @@ impl AeroPhysicsEngine {
                 in_fallout_stopover: false,
                 smoke_disrupted: false,
                 skyglow_entrained: false,
+                is_roosting: false,
                 trail: vec![(lat, lon)],
             });
             id += 1;
         }
 
-        for i in 0..700 {
+        for i in 0..120 {
             let h1 = deterministic_unit(i as u64 * 53 + 5003);
             let h2 = deterministic_unit(i as u64 * 97 + 6011);
             let h3 = deterministic_unit(i as u64 * 139 + 7027);
@@ -439,6 +442,7 @@ impl AeroPhysicsEngine {
                 in_fallout_stopover: false,
                 smoke_disrupted: false,
                 skyglow_entrained: false,
+                is_roosting: false,
                 trail: vec![(lat, lon)],
             });
             id += 1;
@@ -516,7 +520,9 @@ impl AeroPhysicsEngine {
             .collect();
 
         let (min_lat, max_lat, min_lon, max_lon) = params.region.corridor_bounds();
+        let mid_lon = 0.5 * (min_lon + max_lon);
         let radar_nudge = params.radar_nudge_weight.clamp(0.0, 1.0);
+        let _ = is_dusk_window;
 
         let contact_flags: Vec<(u32, u32, u32, u32)> = self
             .agents
@@ -532,6 +538,31 @@ impl AeroPhysicsEngine {
                         .wrapping_mul(1442695040888963407)
                         .wrapping_add(tick_seed * 7),
                 ) - 0.5;
+
+                let phase_hr = (deterministic_unit(
+                    (agent.id as u64)
+                        .wrapping_mul(747796405)
+                        .wrapping_add(2891336453),
+                ) - 0.5)
+                    * 2.2;
+                let halo_deg = 0.18
+                    + 0.27
+                        * deterministic_unit(
+                            (agent.id as u64)
+                                .wrapping_mul(277803737)
+                                .wrapping_add(1442695041),
+                        );
+                let halo_spin = if agent.id % 2 == 0 { 1.0 } else { -1.0 };
+                let local_hr = (hr + (agent.lon - mid_lon) / 15.0 + phase_hr).rem_euclid(24.0);
+                let nocturnal_drive = if local_hr > 12.0 {
+                    smoothstep_f64(sunset_hr - 1.25, sunset_hr + 0.95, local_hr)
+                } else {
+                    1.0 - smoothstep_f64(sunrise_hr - 0.95, sunrise_hr + 1.25, local_hr)
+                };
+                let dusk_pulse = smoothstep_f64(sunset_hr - 1.5, sunset_hr, local_hr)
+                    * (1.0 - smoothstep_f64(sunset_hr + 0.5, sunset_hr + 3.0, local_hr));
+                let diurnal_drive = 1.0 - nocturnal_drive;
+                let bat_drive = (nocturnal_drive + 0.55 * dusk_pulse).clamp(0.0, 1.0);
 
                 let (temp_2m, precip_local, pm25_local, u80, v80, ws80, u850, v850) =
                     interpolate_weather(&weather_snapshot, agent.lat, agent.lon, params, active_doy);
@@ -549,32 +580,51 @@ impl AeroPhysicsEngine {
                         agent.skyglow_entrained = false;
 
                         let smoke_halt = severe_smoke && (agent.id % 5 < 2);
+                        let is_diurnal_bird = (agent.id % 20) >= 13;
+                        let circadian_drive = if is_diurnal_bird {
+                            diurnal_drive
+                        } else {
+                            nocturnal_drive
+                        };
 
-                        if is_nocturnal && total_precip < 2.2 && !smoke_halt && agent.energy_reserve > 0.12 {
+                        if circadian_drive > 0.25 && total_precip < 2.2 && !smoke_halt && agent.energy_reserve > 0.12 {
                             agent.in_fallout_stopover = false;
+                            agent.is_roosting = false;
                             let smoke_drag = if severe_smoke { 0.78 } else { 1.0 };
-                            let airspeed = 11.5 * enkf_gain * smoke_drag;
+                            let speed_ramp = 0.48 + 0.52 * circadian_drive;
+                            let airspeed = 11.5 * enkf_gain * smoke_drag * speed_ramp;
                             let lateral_disp = if severe_smoke { 4.8 } else { 2.2 };
 
                             // Check VIIRS urban skyglow phototactic pull & building collision risk
-                            let (glow_u, glow_v, eff_rad_nw, base_rad_nw, hazard_idx) =
+                            let (glow_u, glow_v, eff_rad_nw, base_rad_nw, hazard_idx) = if !is_diurnal_bird {
                                 sample_skyglow_pull(
                                     agent.lat,
                                     agent.lon,
                                     &skyglow_domes,
-                                    hr,
-                                    is_nocturnal,
+                                    local_hr,
+                                    nocturnal_drive > 0.35,
                                     params.lights_out_curfew_pct,
                                     params.skyglow_intensity_mult,
-                                );
+                                )
+                            } else {
+                                (0.0, 0.0, 0.0, 0.0, 0.0)
+                            };
 
                             if eff_rad_nw > 14.0 && !severe_smoke {
                                 agent.skyglow_entrained = true;
                                 let pull_strength = (eff_rad_nw / 110.0).clamp(0.12, 0.88);
-                                agent.vel_u_mps = airspeed * ((1.0 - 0.55 * pull_strength) * target_u + 0.75 * pull_strength * glow_u)
+                                let orbit_u = -glow_v * halo_spin;
+                                let orbit_v = glow_u * halo_spin;
+                                agent.vel_u_mps = airspeed
+                                    * ((1.0 - 0.55 * pull_strength) * target_u
+                                        + 0.45 * pull_strength * glow_u
+                                        + 0.42 * pull_strength * orbit_u)
                                     + 0.7 * u850
                                     + jitter_a * 4.2;
-                                agent.vel_v_mps = airspeed * ((1.0 - 0.55 * pull_strength) * target_v + 0.75 * pull_strength * glow_v)
+                                agent.vel_v_mps = airspeed
+                                    * ((1.0 - 0.55 * pull_strength) * target_v
+                                        + 0.45 * pull_strength * glow_v
+                                        + 0.42 * pull_strength * orbit_v)
                                     + 0.7 * v850
                                     + jitter_b * 4.2;
                                 // Skyglow disorientation draws nocturnal songbirds down into <260 m AGL facade zone
@@ -585,8 +635,8 @@ impl AeroPhysicsEngine {
 
                                 // Van Doren et al. (2021, PNAS): windy nocturnal migration + lit windows -> glass collisions
                                 let wind_amp = (1.0 + 0.035 * u850.hypot(v850)).clamp(1.0, 1.6);
-                                let base_prob = 0.048 * hazard_idx * (base_rad_nw / 100.0).powf(1.68) * wind_amp * dt_hours.min(1.5);
-                                let eff_prob = 0.048 * hazard_idx * (eff_rad_nw / 100.0).powf(1.68) * wind_amp * dt_hours.min(1.5);
+                                let base_prob = 0.095 * hazard_idx * (base_rad_nw / 100.0).powf(1.68) * wind_amp * dt_hours.min(1.5);
+                                let eff_prob = 0.095 * hazard_idx * (eff_rad_nw / 100.0).powf(1.68) * wind_amp * dt_hours.min(1.5);
                                 let roll = deterministic_unit((agent.id as u64).wrapping_mul(2654435761) ^ tick_seed);
                                 if roll < base_prob {
                                     baseline_urban_strike = 1;
@@ -602,8 +652,8 @@ impl AeroPhysicsEngine {
                                         .clamp(1850.0, 3850.0);
                                 } else {
                                     let ground_m = sample_terrain_elevation_m(agent.lat, agent.lon);
-                                    let radar_target_agl = (radar_peak_alt_asl - ground_m).clamp(380.0, 1950.0);
-                                    let free_agl = (agent.alt_agl_m + jitter_a * 55.0).clamp(380.0, 1950.0);
+                                    let radar_target_agl = (radar_peak_alt_asl - ground_m).clamp(480.0, 3200.0);
+                                    let free_agl = (agent.alt_agl_m + jitter_a * 65.0).clamp(520.0, 3400.0);
                                     agent.alt_agl_m = (1.0 - 0.22 * radar_nudge) * free_agl
                                         + (0.22 * radar_nudge) * radar_target_agl;
                                 }
@@ -612,9 +662,11 @@ impl AeroPhysicsEngine {
                             }
                         } else {
                             agent.in_fallout_stopover = total_precip >= 2.2 || smoke_halt;
-                            let (pull_u, pull_v) = nearest_attractor_vec(agent.lat, agent.lon, &refuges);
-                            agent.vel_u_mps = pull_u * 2.5 + jitter_a * 0.8;
-                            agent.vel_v_mps = pull_v * 2.5 + jitter_b * 0.8;
+                            agent.is_roosting = true;
+                            let (pull_u, pull_v) =
+                                halo_attractor_vec(agent.lat, agent.lon, &refuges, halo_deg, halo_spin);
+                            agent.vel_u_mps = pull_u * 2.2 + 0.35 * target_u + jitter_a * 0.85;
+                            agent.vel_v_mps = pull_v * 2.2 + 0.35 * target_v + jitter_b * 0.85;
                             agent.alt_agl_m = (agent.alt_agl_m * 0.72).clamp(15.0, 140.0);
                             agent.energy_reserve =
                                 (agent.energy_reserve + 0.048 * refueling_mult * dt_hours).min(1.0);
@@ -626,12 +678,13 @@ impl AeroPhysicsEngine {
                         let warm_enough = temp_2m > 7.5;
                         let low_wind_pulse = ws80 < 6.8;
                         let smoke_suppression = if pm25_local >= 160.0 { 0.62 } else { 1.0 };
-                        if (is_nocturnal || is_dusk_window) && warm_enough {
-                            let pulse_boost = if low_wind_pulse { 1.35 } else { 0.55 };
+                        if bat_drive > 0.22 && warm_enough {
+                            agent.is_roosting = false;
+                            let pulse_boost = (if low_wind_pulse { 1.35 } else { 0.55 }) * (0.45 + 0.55 * bat_drive);
                             let airspeed = 6.8 * pulse_boost * smoke_suppression * enkf_gain;
                             agent.vel_u_mps = airspeed * target_u + 0.45 * u80 + jitter_a * 1.8;
                             agent.vel_v_mps = airspeed * target_v + 0.45 * v80 + jitter_b * 1.8;
-                            agent.alt_agl_m = (agent.alt_agl_m + jitter_b * 28.0).clamp(38.0, 340.0);
+                            agent.alt_agl_m = (agent.alt_agl_m + jitter_b * 28.0).clamp(40.0, 300.0);
 
                             for t in turbines {
                                 if (agent.lat - t.lat).abs() < 0.045 && (agent.lon - t.lon).abs() < 0.055 {
@@ -650,9 +703,10 @@ impl AeroPhysicsEngine {
                                 }
                             }
                         } else {
-                            agent.vel_u_mps = jitter_a * 0.25;
-                            agent.vel_v_mps = jitter_b * 0.25;
-                            agent.alt_agl_m = (agent.alt_agl_m * 0.65).clamp(8.0, 35.0);
+                            agent.is_roosting = true;
+                            agent.vel_u_mps = 0.45 * target_u + jitter_a * 0.65;
+                            agent.vel_v_mps = 0.45 * target_v + jitter_b * 0.65;
+                            agent.alt_agl_m = (agent.alt_agl_m * 0.65).clamp(12.0, 42.0);
                         }
                     }
                     Taxon::Butterfly => {
@@ -665,21 +719,30 @@ impl AeroPhysicsEngine {
                             agent.generation = (agent.generation % 4) + 1;
                         }
 
-                        if !is_nocturnal && (12.5..=35.5).contains(&temp_2m) && pm25_local < 220.0 {
-                            let (mw_u, mw_v) = nearest_milkweed_vec(agent.lat, agent.lon, milkweed, aridity);
-                            let airspeed = 4.2 * enkf_gain;
-                            agent.vel_u_mps = airspeed * (0.65 * target_u + 0.35 * mw_u)
+                        let (mw_u, mw_v) = nearest_milkweed_halo_vec(
+                            agent.lat,
+                            agent.lon,
+                            milkweed,
+                            aridity,
+                            halo_deg,
+                            halo_spin,
+                        );
+                        if diurnal_drive > 0.22 && (12.5..=35.5).contains(&temp_2m) && pm25_local < 220.0 {
+                            agent.is_roosting = false;
+                            let airspeed = 4.2 * enkf_gain * (0.42 + 0.58 * diurnal_drive);
+                            agent.vel_u_mps = airspeed * (0.68 * target_u + 0.32 * mw_u)
                                 + 0.30 * u80
                                 + jitter_a * 1.4;
-                            agent.vel_v_mps = airspeed * (0.65 * target_v + 0.35 * mw_v)
+                            agent.vel_v_mps = airspeed * (0.68 * target_v + 0.32 * mw_v)
                                 + 0.30 * v80
                                 + jitter_b * 1.4;
                             agent.alt_agl_m =
-                                (18.0 + (temp_2m - 12.0) * 4.5 + jitter_a * 18.0).clamp(5.0, 145.0);
+                                (14.0 + (temp_2m - 12.0) * 4.2 + jitter_a * 16.0).clamp(5.0, 120.0);
                         } else {
-                            agent.vel_u_mps = 0.0;
-                            agent.vel_v_mps = 0.0;
-                            agent.alt_agl_m = 4.0;
+                            agent.is_roosting = true;
+                            agent.vel_u_mps = 0.85 * mw_u + 0.45 * target_u + jitter_a * 0.45;
+                            agent.vel_v_mps = 0.85 * mw_v + 0.45 * target_v + jitter_b * 0.45;
+                            agent.alt_agl_m = 5.0;
                         }
                     }
                 }
@@ -1066,27 +1129,59 @@ fn interpolate_weather(
     (t_final, p_final, pm_final, u80_f, v80_f, ws80_f, u850_f, v850_f)
 }
 
-fn nearest_attractor_vec(lat: f64, lon: f64, targets: &[(f64, f64)]) -> (f64, f64) {
+#[inline]
+fn smoothstep_f64(edge0: f64, edge1: f64, x: f64) -> f64 {
+    let t = ((x - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[inline]
+fn halo_steer(dlat: f64, dlon: f64, halo_deg: f64, spin: f64) -> (f64, f64) {
+    let dist = dlon.hypot(dlat).max(1e-5);
+    let ru = dlon / dist;
+    let rv = dlat / dist;
+    let tu = -rv * spin;
+    let tv = ru * spin;
+    let radial_push = if dist > halo_deg {
+        ((dist - halo_deg) / halo_deg).clamp(0.0, 1.0)
+    } else {
+        -((halo_deg - dist) / halo_deg).clamp(0.0, 0.72)
+    };
+    let tan_w = 0.85 * (1.0 - (dist / (halo_deg * 2.4)).clamp(0.0, 1.0)) + 0.15;
+    let vx = radial_push * ru + tan_w * tu;
+    let vy = radial_push * rv + tan_w * tv;
+    let norm = vx.hypot(vy).max(1e-5);
+    (vx / norm, vy / norm)
+}
+
+fn halo_attractor_vec(
+    lat: f64,
+    lon: f64,
+    targets: &[(f64, f64)],
+    halo_deg: f64,
+    spin: f64,
+) -> (f64, f64) {
     let mut best_d2 = f64::MAX;
     let mut best = (0.0, 0.0);
     for &(tlat, tlon) in targets {
         let dlat = tlat - lat;
         let dlon = tlon - lon;
         let d2 = dlat * dlat + dlon * dlon;
-        if d2 < best_d2 && d2 > 1e-6 {
+        if d2 < best_d2 {
             best_d2 = d2;
-            let len = d2.sqrt();
-            best = (dlon / len, dlat / len);
+            best = halo_steer(dlat, dlon, halo_deg, spin);
         }
     }
     best
 }
 
-fn nearest_milkweed_vec(
+fn nearest_milkweed_halo_vec(
     lat: f64,
     lon: f64,
     patches: &[MilkweedPatch],
     aridity_index: f64,
+    halo_deg: f64,
+    spin: f64,
 ) -> (f64, f64) {
     let mut best_score = f64::MAX;
     let mut best = (0.0, 0.0);
@@ -1099,8 +1194,7 @@ fn nearest_milkweed_vec(
         let weighted = d2 / eff_area.sqrt();
         if weighted < best_score {
             best_score = weighted;
-            let len = d2.sqrt();
-            best = (dlon / len, dlat / len);
+            best = halo_steer(dlat, dlon, halo_deg, spin);
         }
     }
     best
