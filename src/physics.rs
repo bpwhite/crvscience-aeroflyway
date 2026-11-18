@@ -302,6 +302,22 @@ pub struct AeroPhysicsEngine {
     rng_tick: u64,
 }
 
+pub const CPU_SWARM_AGENT_COUNT: usize = 480;
+
+/// Computes the multiplier scaling CPU swarm counts (`cpu_agent_count`, normally `480`)
+/// or 480-agent hex aggregates to the active GPU swarm size (`gpu_agent_count`).
+pub fn compute_gpu_scale_factor(
+    gpu_mode_active: bool,
+    gpu_agent_count: u32,
+    cpu_agent_count: usize,
+) -> f64 {
+    if gpu_mode_active {
+        (gpu_agent_count as f64) / (cpu_agent_count.max(1) as f64)
+    } else {
+        1.0
+    }
+}
+
 impl AeroPhysicsEngine {
     pub fn new() -> Self {
         let region = FlywayRegion::PacificAmericas;
@@ -313,7 +329,7 @@ impl AeroPhysicsEngine {
         let (mean_mtr, peak_alt) = summarize_radar_corridor(&radar_profiles);
 
         let mut engine = Self {
-            agents: Vec::with_capacity(480),
+            agents: Vec::with_capacity(CPU_SWARM_AGENT_COUNT),
             weather_nodes,
             radar_profiles,
             cached_transect_dem: None,
@@ -447,6 +463,7 @@ impl AeroPhysicsEngine {
             });
             id += 1;
         }
+        debug_assert_eq!(self.agents.len(), CPU_SWARM_AGENT_COUNT);
     }
 
     /// Advances the multi-taxa IBM forward by `dt_hours` in parallel via Rayon and updates metrics.

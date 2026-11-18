@@ -526,3 +526,85 @@ fn spawn_tile_worker(
 fn open_tile_store(path: &Path) -> Option<FlywayStore> {
     FlywayStore::open(path).ok()
 }
+
+/// Tests candidate screen offsets around `anchor` and returns the first bounding rectangle
+/// completely inside `canvas_rect.shrink(4.0)` that does not intersect any `placed` rectangle
+/// (with a 3 px spacing margin). Returns `None` if all candidate slots collide.
+pub fn place_non_overlapping_label_rect(
+    anchor: Pos2,
+    marker_radius_px: f32,
+    box_size: Vec2,
+    canvas_rect: Rect,
+    placed: &[Rect],
+) -> Option<Rect> {
+    let bounds = canvas_rect.shrink(4.0);
+    if bounds.width() < box_size.x || bounds.height() < box_size.y {
+        return None;
+    }
+    let r = marker_radius_px.max(2.0);
+    let candidates = [
+        Pos2::new(anchor.x + r + 8.0, anchor.y - box_size.y * 0.5),
+        Pos2::new(anchor.x - box_size.x * 0.5, anchor.y - r - 6.0 - box_size.y),
+        Pos2::new(anchor.x - box_size.x * 0.5, anchor.y + r + 6.0),
+        Pos2::new(anchor.x - r - 8.0 - box_size.x, anchor.y - box_size.y * 0.5),
+        Pos2::new(anchor.x + r + 7.0, anchor.y - r - 4.0 - box_size.y),
+        Pos2::new(anchor.x + r + 7.0, anchor.y + r + 4.0),
+        Pos2::new(anchor.x - r - 7.0 - box_size.x, anchor.y - r - 4.0 - box_size.y),
+        Pos2::new(anchor.x - r - 7.0 - box_size.x, anchor.y + r + 4.0),
+        Pos2::new(anchor.x + r + 22.0, anchor.y - r - 22.0 - box_size.y),
+        Pos2::new(anchor.x - r - 22.0 - box_size.x, anchor.y + r + 22.0),
+        Pos2::new(anchor.x + r + 24.0, anchor.y + 14.0),
+        Pos2::new(anchor.x - r - 24.0 - box_size.x, anchor.y - 14.0 - box_size.y),
+    ];
+
+    for min_pos in candidates {
+        let rect = Rect::from_min_size(min_pos, box_size);
+        let inside = rect.min.x >= bounds.min.x
+            && rect.max.x <= bounds.max.x
+            && rect.min.y >= bounds.min.y
+            && rect.max.y <= bounds.max.y;
+        if !inside {
+            continue;
+        }
+        if !placed.iter().any(|p| p.expand(3.0).intersects(rect)) {
+            return Some(rect);
+        }
+    }
+    None
+}
+
+/// Screen-space collision-avoiding label placer shared across map overlays and validation tests.
+pub struct MapLabelPlacer {
+    pub canvas_rect: Rect,
+    pub placed: Vec<Rect>,
+}
+
+impl MapLabelPlacer {
+    pub fn new(canvas_rect: Rect) -> Self {
+        Self {
+            canvas_rect,
+            placed: Vec::new(),
+        }
+    }
+
+    pub fn reserve_rect(&mut self, rect: Rect) {
+        self.placed.push(rect);
+    }
+
+    pub fn try_place(
+        &mut self,
+        anchor: Pos2,
+        marker_radius_px: f32,
+        box_size: Vec2,
+    ) -> Option<Rect> {
+        let rect = place_non_overlapping_label_rect(
+            anchor,
+            marker_radius_px,
+            box_size,
+            self.canvas_rect,
+            &self.placed,
+        )?;
+        self.placed.push(rect);
+        Some(rect)
+    }
+}

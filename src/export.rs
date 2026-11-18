@@ -43,7 +43,8 @@ struct HexAgg {
 }
 
 /// Writes an [RFC 7946](https://datatracker.ietf.org/doc/html/rfc7946) compliant GeoJSON
-/// `FeatureCollection` (`WGS84` `[lon, lat, elev_m]`, counter-clockwise polygon rings, root `bbox`).
+/// `FeatureCollection` (`WGS84` `[lon, lat, elev_m]`, counter-clockwise polygon rings, root `bbox`)
+/// into `export_dir/aeroflyway_corridor.geojson`.
 pub fn export_corridor_geojson(
     export_dir: impl AsRef<Path>,
     engine: &AeroPhysicsEngine,
@@ -56,6 +57,34 @@ pub fn export_corridor_geojson(
     let dir = export_dir.as_ref();
     fs::create_dir_all(dir).map_err(|e| format!("Create export dir failed: {e}"))?;
     let out_path = dir.join("aeroflyway_corridor.geojson");
+    export_corridor_geojson_to_path(
+        &out_path,
+        engine,
+        params,
+        observations,
+        turbines,
+        milkweed,
+        gpu_scale_factor,
+    )
+}
+
+/// Writes an [RFC 7946](https://datatracker.ietf.org/doc/html/rfc7946) compliant GeoJSON
+/// `FeatureCollection` directly to `out_path`.
+pub fn export_corridor_geojson_to_path(
+    out_path: impl AsRef<Path>,
+    engine: &AeroPhysicsEngine,
+    params: &SimulationParams,
+    observations: &[ObservationRecord],
+    turbines: &[WindTurbine],
+    milkweed: &[MilkweedPatch],
+    gpu_scale_factor: f64,
+) -> Result<(PathBuf, usize), String> {
+    let out_path = out_path.as_ref().to_path_buf();
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| format!("Create export dir failed: {e}"))?;
+        }
+    }
 
     let mut features: Vec<Value> = Vec::new();
     let mut min_lon = 180.0_f64;
@@ -103,7 +132,10 @@ pub fn export_corridor_geojson(
 
     // 2. Spatial H25 Hexagonal Corridor Polygons (counter-clockwise 7-point closed rings per RFC 7946)
     let hex_map = aggregate_hex_corridors(engine);
-    for (hex_key, agg) in &hex_map {
+    let mut hex_keys: Vec<&String> = hex_map.keys().collect();
+    hex_keys.sort();
+    for hex_key in hex_keys {
+        let agg = &hex_map[hex_key];
         let total_twin = agg.birds + agg.bats + agg.butterflies;
         if total_twin < 2 {
             continue;

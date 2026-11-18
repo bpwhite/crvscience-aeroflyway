@@ -14,25 +14,31 @@
 // along with this program.  If not, see <https://gnu.org>.
 
 use aeroflyway::acoustics::{
-    compute_stft_spectrogram, load_wav_file, synthesize_preset_recording, write_wav_16bit,
-    SpectrogramResult, SynthPreset, WavRecording,
+    compute_stft_spectrogram, load_wav_file, magma_lut, make_time_expanded_recording,
+    synthesize_preset_recording, write_time_expanded_wav_16bit, write_wav_16bit,
+    SpectrogramResult, SynthPreset, WavRecording, SPECTROGRAM_DB_CEIL,
 };
 use aeroflyway::basemap::{
-    radar_stations_for_region, seed_milkweed_patches_for_region, seed_wind_turbines_for_region,
+    landmarks_for_region, radar_stations_for_region, seed_milkweed_patches_for_region,
+    seed_wind_turbines_for_region, skyglow_domes_for_region, vector_basemap_for_region,
     FlywayRegion, Taxon,
 };
 use aeroflyway::db::{
     baseline_observations_for_region, spatial_hex_bin, FlywayStore, ModelSnapshot,
     ObservationRecord,
 };
+use aeroflyway::export::{export_corridor_csv_bundle, export_corridor_geojson};
 use aeroflyway::ingest::{
     build_regional_radar_profiles, parse_vpts_csv_text, summarize_profile_mtr_and_peak,
     Cmip6Scenario,
 };
+use aeroflyway::map_engine::{MapLabelPlacer, MapViewport};
 use aeroflyway::physics::{
-    compute_lights_out_collision_reduction_pct, default_synoptic_nodes_for_region,
-    effective_skyglow_radiance_nw, AeroPhysicsEngine, SeasonPreset, SimulationParams,
+    compute_gpu_scale_factor, compute_lights_out_collision_reduction_pct,
+    default_synoptic_nodes_for_region, effective_skyglow_radiance_nw, AeroPhysicsEngine,
+    SeasonPreset, SimulationParams, CPU_SWARM_AGENT_COUNT,
 };
+use eframe::egui::{Pos2, Rect, Vec2};
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::io::Write;
@@ -672,4 +678,378 @@ fn t3_bioacoustic_nfc_stft_classification_and_sqlite_roundtrip() {
             "sqlite_campaign_lights_out_pct": summary.lights_out_pct
         }),
     );
+}
+
+#[test]
+fn t4_global_vector_basemaps_and_label_declutter() {
+    for region in FlywayRegion::ALL {
+        let layer = vector_basemap_for_region(region);
+        assert!(
+            !layer.coastlines.is_empty(),
+            "Region {:?} must have non-empty offline coastlines",
+            region
+        );
+        assert!(
+            !layer.rivers.is_empty(),
+            "Region {:?} must have non-empty offline rivers",
+            region
+        );
+        assert!(
+            !layer.borders.is_empty(),
+            "Region {:?} must have non-empty offline borders",
+            region
+        );
+        let (min_lat, max_lat, min_lon, max_lon) = region.corridor_bounds();
+        for poly in layer
+            .coastlines
+            .iter()
+            .chain(layer.rivers.iter())
+            .chain(layer.borders.iter())
+        {
+            assert!(poly.len() >= 2, "Basemap polyline must have >= 2 vertices");
+            for &(lat, lon) in *poly {
+                assert!(lat.is_finite() && lon.is_finite());
+                assert!((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon));
+                assert!(
+                    lat >= min_lat - 12.0
+                        && lat <= max_lat + 12.0
+                        && lon >= min_lon - 14.0
+                        && lon <= max_lon + 14.0,
+                    "Vertex ({lat}, {lon}) out of buffered corridor bounds for {:?}",
+                    region
+                );
+            }
+        }
+    }
+
+    // Verify Willamette / Columbia / Klamath label placement at zoom = 5.95 and 6.8 has zero overlaps
+    let temp = TempDirGuard::new("aeroflyway_t4_declutter");
+    let db_path = temp.path.join("declutter_test.db");
+    let canvas_rect = Rect::from_min_size(Pos2::new(350.0, 60.0), Vec2::new(1240.0, 680.0));
+    let hud_rect = Rect::from_min_size(
+        Pos2::new(canvas_rect.left() + 12.0, canvas_rect.bottom() - 54.0),
+        Vec2::new(260.0, 42.0),
+    );
+    let legend_rect = Rect::from_min_size(
+        Pos2::new(canvas_rect.right() - 260.0, canvas_rect.bottom() - 86.0),
+        Vec2::new(248.0, 74.0),
+    );
+
+    for zoom in [5.95_f64, 6.80_f64] {
+        let mut map = MapViewport::new(db_path.clone());
+        map.jump_to(44.48, -122.95, zoom);
+        let mut placer = MapLabelPlacer::new(canvas_rect);
+        placer.reserve_rect(hud_rect);
+        placer.reserve_rect(legend_rect);
+
+        let mut items: Vec<(u8, Pos2, f32, Vec2)> = Vec::new();
+        for r in radar_stations_for_region(FlywayRegion::PacificAmericas) {
+            let sp = map.lat_lon_to_screen(r.lat, r.lon, canvas_rect);
+            if canvas_rect.contains(sp) {
+                items.push((0, sp, 5.0, Vec2::new(160.0, 18.0)));
+            }
+        }
+        for d in skyglow_domes_for_region(FlywayRegion::PacificAmericas) {
+            let sp = map.lat_lon_to_screen(d.lat, d.lon, canvas_rect);
+            if canvas_rect.contains(sp) {
+                items.push((1, sp, 12.0, Vec2::new(210.0, 18.0)));
+            }
+        }
+        for lm in landmarks_for_region(FlywayRegion::PacificAmericas) {
+            let sp = map.lat_lon_to_screen(lm.lat, lm.lon, canvas_rect);
+            if canvas_rect.contains(sp) {
+                items.push((2, sp, 5.5, Vec2::new(185.0, 18.0)));
+            }
+        }
+        items.sort_by_key(|x| x.0);
+
+        let mut placed_labels = Vec::new();
+        for (_, anchor, radius, size) in items {
+            if let Some(rect) = placer.try_place(anchor, radius, size) {
+                placed_labels.push(rect);
+            }
+        }
+
+        assert!(
+            placed_labels.len() >= 10,
+            "Expected >= 10 non-overlapping map labels at zoom={zoom}, placed {}",
+            placed_labels.len()
+        );
+        for i in 0..placed_labels.len() {
+            for j in (i + 1)..placed_labels.len() {
+                assert!(
+                    !placed_labels[i].intersects(placed_labels[j]),
+                    "Label overlap detected at zoom={zoom}: {:?} vs {:?}",
+                    placed_labels[i],
+                    placed_labels[j]
+                );
+            }
+            assert!(!placed_labels[i].intersects(hud_rect));
+            assert!(!placed_labels[i].intersects(legend_rect));
+        }
+    }
+}
+
+#[test]
+fn t5_gpu_swarm_scale_factor_and_export_parity() {
+    assert_eq!(CPU_SWARM_AGENT_COUNT, 480);
+    let mut engine = AeroPhysicsEngine::new();
+    assert_eq!(engine.agents.len(), CPU_SWARM_AGENT_COUNT);
+
+    assert!((compute_gpu_scale_factor(true, 2400, 480) - 5.0).abs() < 1e-12);
+    assert!((compute_gpu_scale_factor(true, 2560, 480) - (2560.0 / 480.0)).abs() < 1e-12);
+    assert!((compute_gpu_scale_factor(false, 2560, 480) - 1.0).abs() < 1e-12);
+    assert!((compute_gpu_scale_factor(true, 2400, 0) - 2400.0).abs() < 1e-12);
+
+    let params = SimulationParams::default();
+    let turbines = seed_wind_turbines_for_region(params.region);
+    let patches = seed_milkweed_patches_for_region(params.region);
+    let obs = baseline_observations_for_region(params.region);
+    engine.step(1.0, &params, &turbines, &patches, &obs);
+
+    let temp_1x = TempDirGuard::new("aeroflyway_t5_1x");
+    let temp_5x = TempDirGuard::new("aeroflyway_t5_5x");
+
+    let (gj_1x, _) =
+        export_corridor_geojson(&temp_1x.path, &engine, &params, &obs, &turbines, &patches, 1.0)
+            .expect("export 1x geojson");
+    let (gj_5x, _) =
+        export_corridor_geojson(&temp_5x.path, &engine, &params, &obs, &turbines, &patches, 5.0)
+            .expect("export 5x geojson");
+
+    let v1: Value = serde_json::from_str(&fs::read_to_string(&gj_1x).unwrap()).unwrap();
+    let v5: Value = serde_json::from_str(&fs::read_to_string(&gj_5x).unwrap()).unwrap();
+    let f1 = v1["features"].as_array().unwrap();
+    let f5 = v5["features"].as_array().unwrap();
+    assert_eq!(f1.len(), f5.len());
+
+    let mut hex_checked = 0usize;
+    for (a, b) in f1.iter().zip(f5.iter()) {
+        assert_eq!(a["id"], b["id"]);
+        if a["properties"]["feature_class"] == "corridor_hex_bin" {
+            let b1 = a["properties"]["estimated_birds"].as_u64().unwrap();
+            let b5 = b["properties"]["estimated_birds"].as_u64().unwrap();
+            let bat1 = a["properties"]["estimated_bats"].as_u64().unwrap();
+            let bat5 = b["properties"]["estimated_bats"].as_u64().unwrap();
+            let bf1 = a["properties"]["estimated_butterflies"].as_u64().unwrap();
+            let bf5 = b["properties"]["estimated_butterflies"].as_u64().unwrap();
+            assert_eq!(b5, b1 * 5);
+            assert_eq!(bat5, bat1 * 5);
+            assert_eq!(bf5, bf1 * 5);
+            hex_checked += 1;
+        }
+    }
+    assert!(hex_checked > 0, "Expected corridor_hex_bin features in GeoJSON export");
+
+    let (csv_1x, _, _) =
+        export_corridor_csv_bundle(&temp_1x.path, &engine, &params, &obs, 1.0).unwrap();
+    let (csv_5x, _, _) =
+        export_corridor_csv_bundle(&temp_5x.path, &engine, &params, &obs, 5.0).unwrap();
+    let rows1: Vec<String> = fs::read_to_string(&csv_1x)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(String::from)
+        .collect();
+    let rows5: Vec<String> = fs::read_to_string(&csv_5x)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(String::from)
+        .collect();
+    assert!(!rows1.is_empty() && rows1.len() == rows5.len());
+    for (r1, r5) in rows1.iter().zip(rows5.iter()) {
+        let c1: Vec<&str> = r1.split(',').collect();
+        let c5: Vec<&str> = r5.split(',').collect();
+        let b1: u64 = c1[5].parse().unwrap();
+        let b5: u64 = c5[5].parse().unwrap();
+        assert_eq!(b5, b1 * 5);
+    }
+}
+
+#[test]
+fn t6_bioacoustic_10x_time_expansion_wav_export() {
+    assert!((SPECTROGRAM_DB_CEIL - (-2.0)).abs() < 1e-6);
+    assert_eq!(magma_lut(0.0), (8, 11, 24));
+    assert_eq!(magma_lut(1.0), (252, 253, 191));
+
+    let temp = TempDirGuard::new("aeroflyway_t6_10x_wav");
+    let rec = synthesize_preset_recording(SynthPreset::HoaryBatUltrasonic250k);
+    let orig_spec = compute_stft_spectrogram(&rec, 1024);
+    assert!(orig_spec.pulses.len() >= 3);
+
+    let out_wav = temp.path.join("hoary_bat_10x_audible.wav");
+    let expanded_sr =
+        write_time_expanded_wav_16bit(&out_wav, &rec, 10, rec.guano_lat_lon).expect("write 10x wav");
+    assert_eq!(expanded_sr, 25_000);
+
+    // Inspect raw RIFF/WAVE header bytes
+    let raw = fs::read(&out_wav).expect("read 10x wav bytes");
+    assert_eq!(&raw[0..4], b"RIFF");
+    assert_eq!(&raw[8..12], b"WAVE");
+    assert_eq!(&raw[12..16], b"fmt ");
+    let hdr_sr = u32::from_le_bytes([raw[24], raw[25], raw[26], raw[27]]);
+    let hdr_byte_rate = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
+    assert_eq!(hdr_sr, 25_000);
+    assert_eq!(hdr_byte_rate, 50_000);
+
+    let reloaded = load_wav_file(&out_wav).expect("reload 10x wav");
+    assert_eq!(reloaded.sample_rate_hz, 25_000);
+    assert_eq!(reloaded.guano_lat_lon, rec.guano_lat_lon);
+    assert!(
+        (reloaded.duration_ms() - rec.duration_ms() * 10.0).abs() < 1e-3,
+        "10x expansion must scale duration by 10x (orig={}, exp={})",
+        rec.duration_ms(),
+        reloaded.duration_ms()
+    );
+
+    let exp_spec = compute_stft_spectrogram(&reloaded, 1024);
+    let expected_fc = orig_spec.characteristic_freq_khz / 10.0;
+    assert!(
+        (exp_spec.characteristic_freq_khz - expected_fc).abs() < 0.25,
+        "10x expansion must divide Fc by 10 (orig={:.2} kHz, exp={:.2} kHz)",
+        orig_spec.characteristic_freq_khz,
+        exp_spec.characteristic_freq_khz
+    );
+
+    // Low sample-rate floor clamp check
+    let low_rec = WavRecording {
+        source_label: "low.wav".to_string(),
+        sample_rate_hz: 8_000,
+        channels: 1,
+        bits_per_sample: 16,
+        samples_mono: vec![0.0; 512],
+        guano_lat_lon: None,
+    };
+    let clamped = make_time_expanded_recording(&low_rec, 10);
+    assert_eq!(clamped.sample_rate_hz, 1000);
+    assert_eq!(clamped.source_label, "low_10x_audible.wav");
+}
+
+#[test]
+fn t7_low_sample_rate_spectrogram_and_pulse_bounds_regression() {
+    let temp = TempDirGuard::new("aeroflyway_t7_low_sr_reg");
+
+    // 1. 16 kHz avian WAV -> 10x time expansion (1600 Hz, Nyquist = 0.8 kHz < 2.0 kHz)
+    let sr_16k = 16_000_u32;
+    let n_16k = (sr_16k as usize * 500) / 1000;
+    let samples_16k: Vec<f32> = (0..n_16k)
+        .map(|i| {
+            let t = i as f64 / sr_16k as f64;
+            let env = if (0.10..=0.35).contains(&t) { 0.55 } else { 0.0 };
+            (env * (2.0 * std::f64::consts::PI * 3_200.0 * t).sin()) as f32
+        })
+        .collect();
+    let rec_16k = WavRecording {
+        source_label: "avian_16k_nfc.wav".to_string(),
+        sample_rate_hz: sr_16k,
+        channels: 1,
+        bits_per_sample: 16,
+        samples_mono: samples_16k,
+        guano_lat_lon: Some((44.5646, -123.2620)),
+    };
+
+    let exp_wav = temp.path.join("avian_16k_10x.wav");
+    let exp_sr = write_time_expanded_wav_16bit(&exp_wav, &rec_16k, 10, rec_16k.guano_lat_lon)
+        .expect("write 10x avian wav");
+    assert_eq!(exp_sr, 1_600);
+
+    let reloaded = load_wav_file(&exp_wav).expect("reload 1600 Hz wav");
+    assert_eq!(reloaded.sample_rate_hz, 1_600);
+    assert!((reloaded.nyquist_khz() - 0.8).abs() < 1e-9);
+
+    let spec = compute_stft_spectrogram(&reloaded, 1024);
+    assert!((spec.max_freq_khz - 0.8).abs() < 1e-9);
+    assert!(spec.num_frames > 0 && spec.num_bins > 0);
+
+    for &vmax in &[
+        -1.0_f64,
+        0.0,
+        0.5,
+        0.8,
+        2.0,
+        4.0,
+        95.0,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ] {
+        let img = spec.to_color_image(-76.0, vmax);
+        assert_eq!(img.size[0], spec.num_frames);
+        assert!(img.size[1] > 0);
+        assert_eq!(img.pixels.len(), img.size[0] * img.size[1]);
+        assert_eq!(img.as_raw().len(), img.size[0] * img.size[1] * 4);
+
+        let (t_ms, f_khz, db) = spec.sample_dbfs_at(0.5, 0.5, vmax);
+        assert!(t_ms.is_finite());
+        assert!(f_khz.is_finite() && (0.0..=spec.max_freq_khz + 1e-9).contains(&f_khz));
+        assert!(db.is_finite());
+    }
+
+    assert_eq!(magma_lut(f32::NAN), (8, 11, 24));
+    assert_eq!(magma_lut(f32::NEG_INFINITY), (8, 11, 24));
+    assert_eq!(magma_lut(f32::INFINITY), (8, 11, 24));
+
+    // 2. CallPulse start_ms + duration_ms <= recording.duration_ms() on 256-sample short WAV
+    let sr_short = 48_000_u32;
+    let short_samples: Vec<f32> = (0..256)
+        .map(|i| {
+            let t = i as f64 / sr_short as f64;
+            (0.6 * (2.0 * std::f64::consts::PI * 4_500.0 * t).sin()) as f32
+        })
+        .collect();
+    let short_rec = WavRecording {
+        source_label: "short_256.wav".to_string(),
+        sample_rate_hz: sr_short,
+        channels: 1,
+        bits_per_sample: 16,
+        samples_mono: short_samples,
+        guano_lat_lon: None,
+    };
+    let short_spec = compute_stft_spectrogram(&short_rec, 2048);
+    assert!(!short_spec.pulses.is_empty(), "Expected pulse in short 256-sample tone");
+    for p in &short_spec.pulses {
+        assert!(p.start_ms >= 0.0 && p.duration_ms >= 0.0);
+        assert!(
+            p.start_ms + p.duration_ms <= short_rec.duration_ms() + 1e-9,
+            "Short pulse overshoot: start={} dur={} rec_dur={}",
+            p.start_ms,
+            p.duration_ms,
+            short_rec.duration_ms()
+        );
+    }
+
+    // 3. CallPulse start_ms + duration_ms <= recording.duration_ms() on 6.0 s long WAV (frames > 900)
+    let sr_long = 250_000_u32;
+    let n_long = sr_long as usize * 6;
+    let long_samples: Vec<f32> = (0..n_long)
+        .map(|i| {
+            let t = i as f64 / sr_long as f64;
+            if t >= 5.85 {
+                (0.6 * (2.0 * std::f64::consts::PI * 30_000.0 * t).sin()) as f32
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let long_rec = WavRecording {
+        source_label: "long_6s.wav".to_string(),
+        sample_rate_hz: sr_long,
+        channels: 1,
+        bits_per_sample: 16,
+        samples_mono: long_samples,
+        guano_lat_lon: None,
+    };
+    let long_spec = compute_stft_spectrogram(&long_rec, 1024);
+    assert!(!long_spec.pulses.is_empty(), "Expected pulse in 6.0 s recording");
+    for p in &long_spec.pulses {
+        assert!(p.start_ms >= 0.0 && p.duration_ms >= 0.0);
+        assert!(
+            p.start_ms + p.duration_ms <= long_rec.duration_ms() + 1e-9,
+            "Long pulse overshoot: start={} dur={} rec_dur={}",
+            p.start_ms,
+            p.duration_ms,
+            long_rec.duration_ms()
+        );
+    }
 }

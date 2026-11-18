@@ -883,10 +883,15 @@ fn run_cli_inspect_wav(args: &[String]) -> Result<(), String> {
                 if let Some(rgba_img) =
                     RgbaImage::from_raw(w as u32, h as u32, cimg.as_raw().to_vec())
                 {
-                    let _ = rgba_img.save(&out_png);
+                    rgba_img
+                        .save(&out_png)
+                        .map_err(|e| format!("Failed saving {}: {e}", out_png.display()))?;
                     Some(out_png.display().to_string())
                 } else {
-                    None
+                    return Err(format!(
+                        "Failed packing RGBA buffer for {}",
+                        out_png.display()
+                    ));
                 }
             } else {
                 None

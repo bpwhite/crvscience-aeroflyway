@@ -13,6 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! AeroFlyway v0.6.0 — Native Rust `wgpu` + WGSL 100k-Agent Multi-Flyway GIS Workstation:
 //! - Startup Campaign Hub (`AppStage::StartupHub`) + Native Persistent Menu Bar (`egui::menu::bar`)
 //! - VIIRS Nighttime Skyglow Urban Collision Modeling & BirdCast `Lights-Out` Curfew Sliders
@@ -20,13 +22,13 @@
 //! - Continuous 365-Day DOY Phenology, Open-Meteo CMIP6 + CAMS PM2.5 Smoke Forcing & WAV STFT Lab.
 
 use aeroflyway::acoustics::{
-    compute_stft_spectrogram, load_wav_file, parse_wav_bytes, synthesize_preset_recording,
-    write_wav_16bit, SpectrogramResult, SynthPreset, WavRecording,
+    compute_stft_spectrogram, load_wav_file, magma_lut, parse_wav_bytes,
+    synthesize_preset_recording, write_time_expanded_wav_16bit, write_wav_16bit,
+    SpectrogramResult, SynthPreset, WavRecording, SPECTROGRAM_DB_CEIL,
 };
 use aeroflyway::basemap::{
-    landmarks_for_region, radar_stations_for_region, skyglow_domes_for_region, FlywayRegion,
-    LandmarkKind, MilkweedPatch, Taxon, WindTurbine, COLUMBIA_RIVER, KLAMATH_SACRAMENTO_CORRIDOR,
-    PACIFIC_COASTLINE, PUGET_SOUND_RING, STATE_BOUNDARIES, WILLAMETTE_RIVER,
+    landmarks_for_region, radar_stations_for_region, skyglow_domes_for_region,
+    vector_basemap_for_region, FlywayRegion, LandmarkKind, MilkweedPatch, Taxon, WindTurbine,
 };
 use aeroflyway::cli::{
     execute_batch_sweep_grid, try_dispatch_cli, write_batch_sweep_reports, BatchScenarioOutcome,
@@ -40,7 +42,7 @@ use eframe::egui::{
     TextureHandle, TextureOptions, Vec2,
 };
 use eframe::egui_wgpu;
-use aeroflyway::export::{export_corridor_csv_bundle, export_corridor_geojson};
+use aeroflyway::export::{export_corridor_csv_bundle, export_corridor_geojson_to_path};
 use aeroflyway::gpu_pipeline::{
     pack_gpu_scene_buffers, pack_gpu_uniforms, FlywayGpuResources, GpuReadbackSummary,
     MapGpuSimAndPaintCallback, SharedReadbackHandle, TransectGpuPaintCallback, DEFAULT_GPU_AGENTS,
@@ -50,10 +52,11 @@ use aeroflyway::ingest::{
     build_regional_radar_profiles, load_vpts_csv_file, spawn_live_ingest, Cmip6Scenario,
     IngestPayload,
 };
-use aeroflyway::map_engine::{haversine_km, BasemapProvider, MapViewport};
+use aeroflyway::map_engine::{haversine_km, BasemapProvider, MapLabelPlacer, MapViewport};
 use aeroflyway::physics::{
-    compute_lights_out_collision_reduction_pct, default_synoptic_nodes_for_region,
-    effective_skyglow_radiance_nw, AeroPhysicsEngine, SeasonPreset, SimulationParams,
+    compute_gpu_scale_factor, compute_lights_out_collision_reduction_pct,
+    default_synoptic_nodes_for_region, effective_skyglow_radiance_nw, AeroPhysicsEngine,
+    SeasonPreset, SimulationParams,
 };
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -125,6 +128,7 @@ struct AcousticInspectorState {
     show_ridge_overlay: bool,
     wav_path_input: String,
     pinned_counter: usize,
+    selected_pulse_idx: Option<usize>,
 }
 
 impl AcousticInspectorState {
@@ -143,23 +147,32 @@ impl AcousticInspectorState {
             show_ridge_overlay: true,
             wav_path_input: String::new(),
             pinned_counter: 1,
+            selected_pulse_idx: None,
         }
     }
 
     fn load_new_recording(&mut self, rec: WavRecording) {
-        let default_top = if rec.nyquist_khz() > 40.0 {
-            rec.nyquist_khz().min(95.0)
+        let nyquist_khz = if rec.nyquist_khz().is_finite() {
+            rec.nyquist_khz().max(0.5)
         } else {
-            rec.nyquist_khz().min(14.0)
+            0.5
         };
-        self.view_max_khz = default_top.max(4.0);
+        let min_khz = nyquist_khz.min(2.0);
+        let default_top = if nyquist_khz > 40.0 {
+            nyquist_khz.min(95.0)
+        } else {
+            nyquist_khz.min(14.0)
+        };
+        self.view_max_khz = default_top.clamp(min_khz, nyquist_khz);
         self.spectrogram = compute_stft_spectrogram(&rec, self.fft_size);
         self.recording = rec;
+        self.selected_pulse_idx = None;
         self.texture_dirty = true;
     }
 
     fn recompute_stft(&mut self) {
         self.spectrogram = compute_stft_spectrogram(&self.recording, self.fft_size);
+        self.selected_pulse_idx = None;
         self.texture_dirty = true;
     }
 
@@ -216,6 +229,7 @@ struct AeroFlywayApp {
     campaign_db_path_input: String,
     active_campaign: CampaignSummary,
     show_help_modal: bool,
+    show_about_modal: bool,
     selected_radar_idx: usize,
     vpts_csv_path_input: String,
 
@@ -328,6 +342,7 @@ impl AeroFlywayApp {
             campaign_db_path_input: db_name,
             active_campaign,
             show_help_modal: false,
+            show_about_modal: false,
             selected_radar_idx: 0,
             vpts_csv_path_input: String::new(),
             store,
@@ -373,29 +388,45 @@ impl AeroFlywayApp {
     }
 
     fn current_scale_factor(&self) -> f64 {
-        if self.gpu_mode_active() {
-            (self.gpu_agent_count as f64) / 2400.0
-        } else {
-            1.0
-        }
+        compute_gpu_scale_factor(
+            self.gpu_mode_active(),
+            self.gpu_agent_count,
+            self.engine.agents.len(),
+        )
     }
 
     fn open_or_switch_campaign_db(&mut self, db_file: &str, title: &str, region: FlywayRegion) {
-        let p = PathBuf::from(db_file.trim());
-        if let Ok(new_store) = FlywayStore::open(&p) {
-            self.store = new_store;
-            self.campaign_db_path_input = db_file.trim().to_string();
-            self.campaign_name_input = title.to_string();
-            self.apply_region_switch(region);
-            let _ = self.store.save_campaign_metadata(
-                title,
-                self.params.region,
-                self.params.day_of_year,
-                self.params.cmip6_scenario.code(),
-                self.params.lights_out_curfew_pct,
-            );
-            self.active_campaign = self.store.load_campaign_summary(db_file.trim());
-            self.status_line = format!("Opened campaign '{}' ({})", title, db_file.trim());
+        let trimmed = db_file.trim();
+        if trimmed.is_empty() {
+            self.status_line = "Campaign DB path cannot be empty.".to_string();
+            return;
+        }
+        let p = PathBuf::from(trimmed);
+        match FlywayStore::open(&p) {
+            Ok(new_store) => {
+                self.store = new_store;
+                self.campaign_db_path_input = trimmed.to_string();
+                self.campaign_name_input = title.to_string();
+                self.apply_region_switch(region);
+                if let Err(err) = self.store.save_campaign_metadata(
+                    title,
+                    self.params.region,
+                    self.params.day_of_year,
+                    self.params.cmip6_scenario.code(),
+                    self.params.lights_out_curfew_pct,
+                ) {
+                    self.status_line = format!(
+                        "Opened campaign '{}' ({}) with metadata save warning: {err}",
+                        title, trimmed
+                    );
+                } else {
+                    self.status_line = format!("Opened campaign '{}' ({})", title, trimmed);
+                }
+                self.active_campaign = self.store.load_campaign_summary(trimmed);
+            }
+            Err(err) => {
+                self.status_line = format!("Failed opening campaign DB '{}': {err}", p.display());
+            }
         }
     }
 
@@ -419,7 +450,7 @@ impl AeroFlywayApp {
         self.params.transect_end = tb;
         self.map.jump_to(clat, clon, zoom);
 
-        let _ = self.store.switch_region_seed(new_region);
+        let seed_err = self.store.switch_region_seed(new_region).err();
         self.observations = self.store.load_observations();
         self.turbines = self.store.load_turbines();
         self.milkweed = self.store.load_milkweed_patches();
@@ -435,12 +466,19 @@ impl AeroFlywayApp {
         self.engine.cached_transect_dem = None;
         self.engine.reseed_agents(new_region, self.params.season);
         self.reset_all_counters();
-        self.status_line = format!(
-            "Switched flyway corridor -> {} (DOY {:.0}, Lights-Out {:.0}%)",
-            new_region.label(),
-            self.params.day_of_year,
-            self.params.lights_out_curfew_pct
-        );
+        self.status_line = if let Some(err) = seed_err {
+            format!(
+                "Switched flyway corridor -> {} (SQLite seed warning: {err})",
+                new_region.label()
+            )
+        } else {
+            format!(
+                "Switched flyway corridor -> {} (DOY {:.0}, Lights-Out {:.0}%)",
+                new_region.label(),
+                self.params.day_of_year,
+                self.params.lights_out_curfew_pct
+            )
+        };
     }
 
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
@@ -582,13 +620,18 @@ impl AeroFlywayApp {
             observed_at: "2026-11-14T04:15Z".to_string(),
         };
 
-        if self.store.upsert_observations(&[rec]).is_ok() {
-            self.observations = self.store.load_observations();
-            self.map.jump_to(lat, lon, self.map.zoom.max(7.8));
-            self.status_line = format!(
-                "Pinned '{}' at ({lat:.4}, {lon:.4}) into SQLite & GIS map",
-                spec.guild_label
-            );
+        match self.store.upsert_observations(&[rec]) {
+            Ok(_) => {
+                self.observations = self.store.load_observations();
+                self.map.jump_to(lat, lon, self.map.zoom.max(7.8));
+                self.status_line = format!(
+                    "Pinned '{}' at ({lat:.4}, {lon:.4}) into SQLite & GIS map",
+                    spec.guild_label
+                );
+            }
+            Err(err) => {
+                self.status_line = format!("Failed pinning acoustic detection to SQLite: {err}");
+            }
         }
     }
 
@@ -617,13 +660,20 @@ impl AeroFlywayApp {
     fn poll_background_channels(&mut self) {
         while let Ok(payload) = self.ingest_rx.try_recv() {
             self.ingest_in_progress = false;
+            let mut db_warn: Option<String> = None;
             if !payload.observations.is_empty() {
-                let _ = self.store.upsert_observations(&payload.observations);
-                self.observations = self.store.load_observations();
+                if let Err(err) = self.store.upsert_observations(&payload.observations) {
+                    db_warn = Some(format!("SQLite observation upsert failed: {err}"));
+                } else {
+                    self.observations = self.store.load_observations();
+                }
             }
             if !payload.turbines.is_empty() {
-                let _ = self.store.upsert_turbines(&payload.turbines);
-                self.turbines = self.store.load_turbines();
+                if let Err(err) = self.store.upsert_turbines(&payload.turbines) {
+                    db_warn = Some(format!("SQLite turbine upsert failed: {err}"));
+                } else {
+                    self.turbines = self.store.load_turbines();
+                }
             }
             if !payload.weather_nodes.is_empty() {
                 self.engine.weather_nodes = payload.weather_nodes;
@@ -634,18 +684,29 @@ impl AeroFlywayApp {
             if payload.transect_dem_m.is_some() {
                 self.engine.cached_transect_dem = payload.transect_dem_m;
             }
-            self.status_line = payload.status_summary;
+            self.status_line = match db_warn {
+                Some(warn) => format!("{} ({warn})", payload.status_summary),
+                None => payload.status_summary,
+            };
         }
 
         while let Ok(sweep_res) = self.batch_ui.sweep_rx.try_recv() {
             self.batch_ui.running_sweep = false;
             let out_dir = self.export_dir_input.trim().to_string();
-            if let Ok((csv_p, _)) = write_batch_sweep_reports(&out_dir, &sweep_res) {
-                self.status_line = format!(
-                    "Completed {} Rayon v0.6 sweep scenarios -> {}",
-                    sweep_res.len(),
-                    csv_p.display()
-                );
+            match write_batch_sweep_reports(&out_dir, &sweep_res) {
+                Ok((csv_p, _)) => {
+                    self.status_line = format!(
+                        "Completed {} Rayon v0.6 sweep scenarios -> {}",
+                        sweep_res.len(),
+                        csv_p.display()
+                    );
+                }
+                Err(err) => {
+                    self.status_line = format!(
+                        "Completed {} scenarios, but sweep export failed: {err}",
+                        sweep_res.len()
+                    );
+                }
             }
             self.batch_ui.outcomes = sweep_res;
         }
@@ -680,46 +741,78 @@ impl AeroFlywayApp {
                         ui.close_menu();
                     }
                     if ui.button("Save Campaign Metadata to SQLite").clicked() {
-                        let _ = self.store.save_campaign_metadata(
+                        match self.store.save_campaign_metadata(
                             &self.campaign_name_input,
                             self.params.region,
                             self.params.day_of_year,
                             self.params.cmip6_scenario.code(),
                             self.params.lights_out_curfew_pct,
-                        );
-                        self.active_campaign = self
-                            .store
-                            .load_campaign_summary(&self.campaign_db_path_input);
-                        self.status_line = format!(
-                            "Saved campaign '{}' into {}",
-                            self.campaign_name_input, self.campaign_db_path_input
-                        );
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Export RFC 7946 GeoJSON").clicked() {
-                        if let Ok((p, n)) = export_corridor_geojson(
-                            self.export_dir_input.trim(),
-                            &self.engine,
-                            &self.params,
-                            &self.observations,
-                            &self.turbines,
-                            &self.milkweed,
-                            self.current_scale_factor(),
                         ) {
-                            self.status_line = format!("Exported {n} GeoJSON features -> {}", p.display());
+                            Ok(()) => {
+                                self.active_campaign = self
+                                    .store
+                                    .load_campaign_summary(&self.campaign_db_path_input);
+                                self.status_line = format!(
+                                    "Saved campaign '{}' into {}",
+                                    self.campaign_name_input, self.campaign_db_path_input
+                                );
+                            }
+                            Err(err) => {
+                                self.status_line =
+                                    format!("Failed saving campaign metadata to SQLite: {err}");
+                            }
                         }
                         ui.close_menu();
                     }
-                    if ui.button("Export Corridor CSV Bundle").clicked() {
-                        if let Ok((hp, _, n)) = export_corridor_csv_bundle(
-                            self.export_dir_input.trim(),
-                            &self.engine,
-                            &self.params,
-                            &self.observations,
-                            self.current_scale_factor(),
-                        ) {
-                            self.status_line = format!("Exported {n} CSV rows -> {}", hp.display());
+                    ui.separator();
+                    if ui.button("Export RFC 7946 GeoJSON...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title("Save RFC 7946 Corridor GeoJSON")
+                            .add_filter("GeoJSON", &["geojson", "json"])
+                            .set_file_name("aeroflyway_corridor.geojson")
+                            .save_file()
+                        {
+                            match export_corridor_geojson_to_path(
+                                &path,
+                                &self.engine,
+                                &self.params,
+                                &self.observations,
+                                &self.turbines,
+                                &self.milkweed,
+                                self.current_scale_factor(),
+                            ) {
+                                Ok((p, n)) => {
+                                    self.status_line =
+                                        format!("Exported {n} GeoJSON features -> {}", p.display());
+                                }
+                                Err(err) => {
+                                    self.status_line = format!("GeoJSON export error: {err}");
+                                }
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Export Corridor CSV Bundle...").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Select Export Folder for Corridor CSV Bundle")
+                            .pick_folder()
+                        {
+                            self.export_dir_input = dir.display().to_string();
+                            match export_corridor_csv_bundle(
+                                &dir,
+                                &self.engine,
+                                &self.params,
+                                &self.observations,
+                                self.current_scale_factor(),
+                            ) {
+                                Ok((hp, _, n)) => {
+                                    self.status_line =
+                                        format!("Exported {n} CSV rows -> {}", hp.display());
+                                }
+                                Err(err) => {
+                                    self.status_line = format!("CSV bundle export error: {err}");
+                                }
+                            }
                         }
                         ui.close_menu();
                     }
@@ -817,6 +910,10 @@ impl AeroFlywayApp {
                         self.show_help_modal = true;
                         ui.close_menu();
                     }
+                    if ui.button("About AeroFlyway...").clicked() {
+                        self.show_about_modal = true;
+                        ui.close_menu();
+                    }
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -830,6 +927,14 @@ impl AeroFlywayApp {
                             AppStage::Workbench => AppStage::StartupHub,
                         };
                     }
+                    if ui.button("About").clicked() {
+                        self.show_about_modal = true;
+                    }
+                    ui.small(
+                        RichText::new("Copyright CRV Science Network")
+                            .color(Color32::from_rgb(148, 163, 184)),
+                    );
+                    ui.separator();
                     ui.small(
                         RichText::new(format!(
                             "Campaign: {} ({})",
@@ -880,9 +985,39 @@ impl AeroFlywayApp {
                             ui.label("Campaign Title:");
                             ui.text_edit_singleline(&mut self.campaign_name_input);
                         });
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("SQLite `.db` File:");
-                            ui.text_edit_singleline(&mut self.campaign_db_path_input);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.campaign_db_path_input)
+                                    .desired_width(175.0),
+                            );
+                            if ui.button("Browse .db...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_title("Open SQLite Campaign Workspace")
+                                    .add_filter("SQLite Campaign", &["db", "sqlite", "sqlite3"])
+                                    .pick_file()
+                                {
+                                    let db_f = path.display().to_string();
+                                    self.campaign_db_path_input = db_f.clone();
+                                    let title = self.campaign_name_input.clone();
+                                    let reg = self.params.region;
+                                    self.open_or_switch_campaign_db(&db_f, &title, reg);
+                                }
+                            }
+                            if ui.button("New .db...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_title("Create SQLite Campaign Workspace")
+                                    .add_filter("SQLite Campaign", &["db", "sqlite"])
+                                    .set_file_name("aeroflyway_campaign.db")
+                                    .save_file()
+                                {
+                                    let db_f = path.display().to_string();
+                                    self.campaign_db_path_input = db_f.clone();
+                                    let title = self.campaign_name_input.clone();
+                                    let reg = self.params.region;
+                                    self.open_or_switch_campaign_db(&db_f, &title, reg);
+                                }
+                            }
                             if ui.button("Open / Create .db").clicked() {
                                 let db_f = self.campaign_db_path_input.clone();
                                 let title = self.campaign_name_input.clone();
@@ -1002,6 +1137,21 @@ impl AeroFlywayApp {
                         });
                     });
                 });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.small(
+                        RichText::new("Copyright CRV Science Network (GPL-3.0-or-later)")
+                            .color(Color32::from_rgb(148, 163, 184)),
+                    );
+                    ui.separator();
+                    if ui.small_button("About AeroFlyway").clicked() {
+                        self.show_about_modal = true;
+                    }
+                    ui.hyperlink_to("https://crvscience.com", "https://crvscience.com");
+                    ui.hyperlink_to("https://crvscience.com/apps", "https://crvscience.com/apps");
+                });
             });
         });
 
@@ -1037,6 +1187,42 @@ impl AeroFlywayApp {
                 ui.small("- Climate & Megafire Smoke: Open-Meteo Forecast, CMIP6 Climate (/v1/climate), CAMS Air Quality (/v1/air-quality), Copernicus GLO-90 DEM (/v1/elevation), and Overton et al. (2022, Ecology) PM2.5 >= 160 ug/m^3 ceiling climbs.");
             });
         self.show_help_modal = open;
+    }
+
+    fn render_about_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_about_modal {
+            return;
+        }
+        let mut open = self.show_about_modal;
+        egui::Window::new("About AeroFlyway")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(500.0)
+            .show(ctx, |ui| {
+                ui.heading(
+                    RichText::new(format!("AeroFlyway v{}", env!("CARGO_PKG_VERSION")))
+                        .color(Color32::from_rgb(56, 189, 248)),
+                );
+                ui.label(
+                    RichText::new("Global Aeroecology, VIIRS Lights-Out, NEXRAD/Aloft Radar & Bioacoustic Workstation")
+                        .color(Color32::from_rgb(203, 213, 225)),
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new("Copyright CRV Science Network").strong());
+                ui.small(
+                    "Licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later). \
+                     This program comes with ABSOLUTELY NO WARRANTY.",
+                );
+                ui.separator();
+                ui.label(RichText::new("CRV Science Network Resources").strong());
+                ui.hyperlink_to("CRV Science Network (https://crvscience.com)", "https://crvscience.com");
+                ui.hyperlink_to("CRV Science Apps Hub (https://crvscience.com/apps)", "https://crvscience.com/apps");
+                ui.hyperlink_to(
+                    "Companion Preprint (APP-PREPRINT-13)",
+                    "https://crvscience.com/apps/preprints/aeroflyway-avian-migration-radar",
+                );
+            });
+        self.show_about_modal = open;
     }
 
     fn render_top_bar(&mut self, ctx: &egui::Context) {
@@ -1752,6 +1938,17 @@ impl AeroFlywayApp {
             ui.separator();
             ui.label("Import VPTS .csv:");
             ui.add(egui::TextEdit::singleline(&mut self.vpts_csv_path_input).desired_width(150.0));
+            if ui.button("Browse .csv...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Open NEXRAD / Aloft VPTS CSV")
+                    .add_filter("VPTS Radar CSV", &["csv", "txt"])
+                    .pick_file()
+                {
+                    let p_str = path.display().to_string();
+                    self.vpts_csv_path_input = p_str.clone();
+                    import_path = Some(p_str);
+                }
+            }
             if ui.button("Load VPTS").clicked() {
                 let p = self.vpts_csv_path_input.trim().to_string();
                 if !p.is_empty() {
@@ -1911,8 +2108,29 @@ impl AeroFlywayApp {
             ui.separator();
             ui.label("WAV Path:");
             ui.add(
-                egui::TextEdit::singleline(&mut self.acoustics.wav_path_input).desired_width(145.0),
+                egui::TextEdit::singleline(&mut self.acoustics.wav_path_input).desired_width(135.0),
             );
+            if ui.button("Browse .wav...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Open Bioacoustic WAV Recording")
+                    .add_filter("WAV Audio", &["wav", "WAV"])
+                    .pick_file()
+                {
+                    self.acoustics.wav_path_input = path.display().to_string();
+                    match load_wav_file(&path) {
+                        Ok(rec) => {
+                            self.status_line = format!(
+                                "Loaded WAV '{}' ({:.1} kHz, {:.0} ms)",
+                                rec.source_label,
+                                rec.sample_rate_hz as f64 / 1000.0,
+                                rec.duration_ms()
+                            );
+                            self.acoustics.load_new_recording(rec);
+                        }
+                        Err(e) => self.status_line = e,
+                    }
+                }
+            }
             if ui.button("Load .wav").clicked() {
                 let p = self.acoustics.wav_path_input.trim().to_string();
                 if !p.is_empty() {
@@ -1926,21 +2144,63 @@ impl AeroFlywayApp {
                 }
             }
 
+            let coords = self
+                .acoustics
+                .recording
+                .guano_lat_lon
+                .or(Some((self.map.center_lat, self.map.center_lon)));
+
             if ui.button("Save Sample .wav").clicked() {
-                let out_dir = PathBuf::from(self.export_dir_input.trim());
-                let _ = std::fs::create_dir_all(&out_dir);
-                let wav_out = out_dir.join(&self.acoustics.recording.source_label);
-                let coords = self
+                if let Some(wav_out) = rfd::FileDialog::new()
+                    .set_title("Save 16-Bit GUANO WAV")
+                    .add_filter("WAV Audio", &["wav"])
+                    .set_file_name(&self.acoustics.recording.source_label)
+                    .save_file()
+                {
+                    match write_wav_16bit(&wav_out, &self.acoustics.recording, coords) {
+                        Ok(()) => {
+                            self.status_line =
+                                format!("Saved 16-bit GUANO WAV -> {}", wav_out.display());
+                        }
+                        Err(e) => self.status_line = e,
+                    }
+                }
+            }
+
+            if ui.button("Export 10x Audible .wav").clicked() {
+                let stem = self
                     .acoustics
                     .recording
-                    .guano_lat_lon
-                    .or(Some((self.map.center_lat, self.map.center_lon)));
-                match write_wav_16bit(&wav_out, &self.acoustics.recording, coords) {
-                    Ok(()) => {
-                        self.status_line =
-                            format!("Saved 16-bit GUANO WAV -> {}", wav_out.display());
+                    .source_label
+                    .strip_suffix(".wav")
+                    .or_else(|| self.acoustics.recording.source_label.strip_suffix(".WAV"))
+                    .unwrap_or(&self.acoustics.recording.source_label);
+                let default_name = format!("{stem}_10x_audible.wav");
+                if let Some(wav_out) = rfd::FileDialog::new()
+                    .set_title("Export 10x Time-Expanded Audible WAV")
+                    .add_filter("WAV Audio", &["wav"])
+                    .set_file_name(&default_name)
+                    .save_file()
+                {
+                    let orig_khz = self.acoustics.recording.sample_rate_hz as f64 / 1000.0;
+                    match write_time_expanded_wav_16bit(
+                        &wav_out,
+                        &self.acoustics.recording,
+                        10,
+                        coords,
+                    ) {
+                        Ok(expanded_sr) => {
+                            let actual_factor =
+                                self.acoustics.recording.sample_rate_hz as f64 / expanded_sr.max(1) as f64;
+                            let exp_dur_ms = self.acoustics.recording.duration_ms() * actual_factor;
+                            self.status_line = format!(
+                                "Exported 10x audible WAV ({orig_khz:.1} -> {:.1} kHz, {exp_dur_ms:.0} ms) -> {}",
+                                expanded_sr as f64 / 1000.0,
+                                wav_out.display()
+                            );
+                        }
+                        Err(e) => self.status_line = e,
                     }
-                    Err(e) => self.status_line = e,
                 }
             }
 
@@ -1955,13 +2215,37 @@ impl AeroFlywayApp {
                 }
             }
 
-            let prev_floor = self.acoustics.db_floor;
-            ui.add(
-                egui::Slider::new(&mut self.acoustics.db_floor, -95.0..=-35.0)
-                    .text("dB floor")
-                    .fixed_decimals(0),
-            );
-            if (self.acoustics.db_floor - prev_floor).abs() > 0.2 {
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.acoustics.db_floor, -95.0..=-35.0)
+                        .text("dB floor")
+                        .fixed_decimals(0),
+                )
+                .changed()
+            {
+                self.acoustics.texture_dirty = true;
+            }
+
+            let nyquist_khz = if self.acoustics.spectrogram.max_freq_khz.is_finite() {
+                self.acoustics.spectrogram.max_freq_khz.max(0.5)
+            } else {
+                0.5
+            };
+            let min_khz = nyquist_khz.min(2.0);
+            self.acoustics.view_max_khz = if self.acoustics.view_max_khz.is_finite() {
+                self.acoustics.view_max_khz
+            } else {
+                nyquist_khz
+            }
+            .clamp(min_khz, nyquist_khz);
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.acoustics.view_max_khz, min_khz..=nyquist_khz)
+                        .text("Max kHz")
+                        .fixed_decimals(1),
+                )
+                .changed()
+            {
                 self.acoustics.texture_dirty = true;
             }
 
@@ -1994,78 +2278,280 @@ impl AeroFlywayApp {
 
         let tex_id = self.acoustics.ensure_texture(ctx).id();
         let avail = ui.available_size();
-        let (outer, resp) = ui.allocate_exact_size(avail, Sense::hover());
-        let painter = ui.painter_at(outer);
+        let right_w = (avail.x * 0.34).clamp(250.0, 440.0);
+        let left_w = (avail.x - right_w - 8.0).max(260.0);
+        let row_h = avail.y.max(100.0);
 
-        painter.rect_filled(outer, CornerRadius::same(4), Color32::from_rgb(8, 11, 24));
-        painter.rect_stroke(
-            outer,
-            CornerRadius::same(4),
-            Stroke::new(1.0, Color32::from_rgb(45, 58, 82)),
-            StrokeKind::Inside,
-        );
+        ui.horizontal_top(|ui| {
+            // Left: STFT Spectrogram + Y kHz ticks + X ms ticks + Magma dBFS colorbar + pulse highlight
+            let (outer, resp) = ui.allocate_exact_size(Vec2::new(left_w, row_h), Sense::hover());
+            let painter = ui.painter_at(outer);
 
-        let inner = Rect::from_min_max(
-            Pos2::new(outer.min.x + 52.0, outer.min.y + 8.0),
-            Pos2::new(outer.max.x - 14.0, outer.max.y - 20.0),
-        );
-        if inner.width() < 40.0 || inner.height() < 24.0 {
-            return;
-        }
-
-        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-        painter.image(tex_id, inner, uv, Color32::WHITE);
-
-        let top_khz = self
-            .acoustics
-            .view_max_khz
-            .clamp(2.0, self.acoustics.spectrogram.max_freq_khz.max(2.0));
-
-        for step in 0..=4 {
-            let frac = step as f32 / 4.0;
-            let y = inner.bottom() - frac * inner.height();
-            let khz = (frac as f64) * top_khz;
-            painter.text(
-                Pos2::new(inner.left() - 6.0, y),
-                Align2::RIGHT_CENTER,
-                format!("{khz:.1}k"),
-                FontId::monospace(9.5),
-                Color32::from_rgb(203, 213, 225),
+            painter.rect_filled(outer, CornerRadius::same(4), Color32::from_rgb(8, 11, 24));
+            painter.rect_stroke(
+                outer,
+                CornerRadius::same(4),
+                Stroke::new(1.0, Color32::from_rgb(45, 58, 82)),
+                StrokeKind::Inside,
             );
-        }
 
-        if self.acoustics.show_ridge_overlay && self.acoustics.spectrogram.num_frames > 1 {
-            let n_f = self.acoustics.spectrogram.num_frames;
-            for (f_idx, opt_khz) in self.acoustics.spectrogram.ridge_khz.iter().enumerate() {
-                if let Some(khz) = opt_khz {
-                    if (*khz as f64) <= top_khz {
-                        let fx = (f_idx as f32) / ((n_f - 1) as f32);
-                        let fy = ((*khz as f64) / top_khz) as f32;
-                        let p = Pos2::new(
-                            inner.left() + fx * inner.width(),
-                            inner.bottom() - fy * inner.height(),
+            let inner = Rect::from_min_max(
+                Pos2::new(outer.min.x + 52.0, outer.min.y + 8.0),
+                Pos2::new(outer.max.x - 68.0, outer.max.y - 24.0),
+            );
+            if inner.width() >= 40.0 && inner.height() >= 24.0 {
+                let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+                painter.image(tex_id, inner, uv, Color32::WHITE);
+
+                let nyquist_khz = if self.acoustics.spectrogram.max_freq_khz.is_finite() {
+                    self.acoustics.spectrogram.max_freq_khz.max(0.5)
+                } else {
+                    0.5
+                };
+                let min_khz = nyquist_khz.min(2.0);
+                let top_khz = if self.acoustics.view_max_khz.is_finite() {
+                    self.acoustics.view_max_khz
+                } else {
+                    nyquist_khz
+                }
+                .clamp(min_khz, nyquist_khz);
+                let dur_ms = self.acoustics.spectrogram.duration_ms.max(1.0);
+
+                // Y-axis frequency ticks (kHz)
+                for step in 0..=4 {
+                    let frac = step as f32 / 4.0;
+                    let y = inner.bottom() - frac * inner.height();
+                    let khz = (frac as f64) * top_khz;
+                    painter.line_segment(
+                        [Pos2::new(inner.left() - 4.0, y), Pos2::new(inner.left(), y)],
+                        Stroke::new(1.0, Color32::from_rgb(100, 116, 139)),
+                    );
+                    painter.text(
+                        Pos2::new(inner.left() - 6.0, y),
+                        Align2::RIGHT_CENTER,
+                        format!("{khz:.1}k"),
+                        FontId::monospace(9.5),
+                        Color32::from_rgb(203, 213, 225),
+                    );
+                }
+
+                // X-axis time ticks (ms)
+                for step in 0..=4 {
+                    let frac = step as f32 / 4.0;
+                    let x = inner.left() + frac * inner.width();
+                    let t_ms = (frac as f64) * dur_ms;
+                    painter.line_segment(
+                        [Pos2::new(x, inner.bottom()), Pos2::new(x, inner.bottom() + 4.0)],
+                        Stroke::new(1.0, Color32::from_rgb(100, 116, 139)),
+                    );
+                    let align = match step {
+                        0 => Align2::LEFT_TOP,
+                        4 => Align2::RIGHT_TOP,
+                        _ => Align2::CENTER_TOP,
+                    };
+                    painter.text(
+                        Pos2::new(x, inner.bottom() + 5.0),
+                        align,
+                        format!("{t_ms:.0} ms"),
+                        FontId::monospace(9.5),
+                        Color32::from_rgb(203, 213, 225),
+                    );
+                }
+
+                // Magma dBFS vertical colorbar
+                let cbar_rect = Rect::from_min_max(
+                    Pos2::new(inner.right() + 10.0, inner.top()),
+                    Pos2::new(inner.right() + 24.0, inner.bottom()),
+                );
+                let steps = 32usize;
+                let strip_h = cbar_rect.height() / (steps as f32);
+                for s in 0..steps {
+                    let t = 1.0 - (s as f32 + 0.5) / (steps as f32);
+                    let (r, g, b) = magma_lut(t);
+                    let y0 = cbar_rect.top() + (s as f32) * strip_h;
+                    let y1 = (y0 + strip_h + 0.5).min(cbar_rect.bottom());
+                    painter.rect_filled(
+                        Rect::from_min_max(Pos2::new(cbar_rect.left(), y0), Pos2::new(cbar_rect.right(), y1)),
+                        CornerRadius::same(0),
+                        Color32::from_rgb(r, g, b),
+                    );
+                }
+                painter.rect_stroke(
+                    cbar_rect,
+                    CornerRadius::same(1),
+                    Stroke::new(1.0, Color32::from_rgb(71, 85, 105)),
+                    StrokeKind::Inside,
+                );
+                let db_mid = 0.5 * (SPECTROGRAM_DB_CEIL + self.acoustics.db_floor);
+                for (y, lbl) in [
+                    (cbar_rect.top(), format!("{:.0} dB", SPECTROGRAM_DB_CEIL)),
+                    (cbar_rect.center().y, format!("{db_mid:.0}")),
+                    (cbar_rect.bottom(), format!("{:.0} dB", self.acoustics.db_floor)),
+                ] {
+                    painter.text(
+                        Pos2::new(cbar_rect.right() + 4.0, y),
+                        Align2::LEFT_CENTER,
+                        lbl,
+                        FontId::monospace(9.0),
+                        Color32::from_rgb(203, 213, 225),
+                    );
+                }
+
+                if self.acoustics.show_ridge_overlay && self.acoustics.spectrogram.num_frames > 1 {
+                    let n_f = self.acoustics.spectrogram.num_frames;
+                    for (f_idx, opt_khz) in self.acoustics.spectrogram.ridge_khz.iter().enumerate() {
+                        if let Some(khz) = opt_khz {
+                            if (*khz as f64) <= top_khz {
+                                let fx = (f_idx as f32) / ((n_f - 1) as f32);
+                                let fy = ((*khz as f64) / top_khz) as f32;
+                                let p = Pos2::new(
+                                    inner.left() + fx * inner.width(),
+                                    inner.bottom() - fy * inner.height(),
+                                );
+                                painter.circle_filled(p, 1.8, Color32::from_rgb(56, 189, 248));
+                            }
+                        }
+                    }
+                }
+
+                // Pulse bounding boxes & selected pulse highlight
+                for (p_idx, pulse) in self.acoustics.spectrogram.pulses.iter().enumerate() {
+                    if pulse.f_min_khz > top_khz {
+                        continue;
+                    }
+                    let x0 = inner.left() + ((pulse.start_ms / dur_ms).clamp(0.0, 1.0) as f32) * inner.width();
+                    let x1 = inner.left()
+                        + (((pulse.start_ms + pulse.duration_ms) / dur_ms).clamp(0.0, 1.0) as f32)
+                            * inner.width();
+                    let y_top = inner.bottom()
+                        - ((pulse.f_max_khz.min(top_khz) / top_khz).clamp(0.0, 1.0) as f32)
+                            * inner.height();
+                    let y_bot = inner.bottom()
+                        - ((pulse.f_min_khz.min(top_khz) / top_khz).clamp(0.0, 1.0) as f32)
+                            * inner.height();
+                    let p_rect = Rect::from_min_max(
+                        Pos2::new(x0.min(x1 - 2.0), y_top.min(y_bot - 4.0)),
+                        Pos2::new(x1.max(x0 + 3.0), y_bot.max(y_top + 4.0)),
+                    );
+                    let is_selected = self.acoustics.selected_pulse_idx == Some(p_idx);
+                    if is_selected {
+                        painter.rect_filled(
+                            p_rect.expand(3.0),
+                            CornerRadius::same(2),
+                            Color32::from_rgba_unmultiplied(250, 204, 21, 38),
                         );
-                        painter.circle_filled(p, 1.8, Color32::from_rgb(56, 189, 248));
+                        painter.rect_stroke(
+                            p_rect.expand(3.0),
+                            CornerRadius::same(2),
+                            Stroke::new(1.8, Color32::from_rgb(250, 204, 21)),
+                            StrokeKind::Outside,
+                        );
+                        painter.text(
+                            Pos2::new(p_rect.center().x, (p_rect.top() - 4.0).max(inner.top() + 10.0)),
+                            Align2::CENTER_BOTTOM,
+                            format!("P{} Fc={:.1}k", p_idx + 1, pulse.f_char_khz),
+                            FontId::monospace(9.5),
+                            Color32::from_rgb(254, 240, 138),
+                        );
+                    } else {
+                        painter.rect_stroke(
+                            p_rect,
+                            CornerRadius::same(1),
+                            Stroke::new(0.8, Color32::from_rgba_unmultiplied(148, 163, 184, 75)),
+                            StrokeKind::Outside,
+                        );
+                    }
+                }
+
+                if let Some(hp) = resp.hover_pos() {
+                    if inner.contains(hp) {
+                        let nx = (hp.x - inner.left()) / inner.width();
+                        let ny = (hp.y - inner.top()) / inner.height();
+                        let (t_ms, f_khz, db) =
+                            self.acoustics.spectrogram.sample_dbfs_at(nx, ny, top_khz);
+                        let badge = format!(" {t_ms:.1} ms | {f_khz:.2} kHz | {db:.1} dBFS ");
+                        painter.text(
+                            Pos2::new(inner.right() - 8.0, inner.top() + 10.0),
+                            Align2::RIGHT_TOP,
+                            badge,
+                            FontId::monospace(10.5),
+                            Color32::from_rgb(254, 240, 138),
+                        );
                     }
                 }
             }
-        }
 
-        if let Some(hp) = resp.hover_pos() {
-            if inner.contains(hp) {
-                let nx = (hp.x - inner.left()) / inner.width();
-                let ny = (hp.y - inner.top()) / inner.height();
-                let (t_ms, f_khz, db) = self.acoustics.spectrogram.sample_dbfs_at(nx, ny, top_khz);
-                let badge = format!(" {t_ms:.1} ms | {f_khz:.2} kHz | {db:.1} dBFS ");
-                painter.text(
-                    Pos2::new(inner.right() - 8.0, inner.top() + 10.0),
-                    Align2::RIGHT_TOP,
-                    badge,
-                    FontId::monospace(10.5),
-                    Color32::from_rgb(254, 240, 138),
-                );
-            }
-        }
+            // Right: Clickable Call Pulses Table (`spec.pulses`)
+            ui.allocate_ui_with_layout(
+                Vec2::new(right_w, row_h),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    let pulses = &self.acoustics.spectrogram.pulses;
+                    ui.horizontal(|ui| {
+                        let hdr = if pulses.is_empty() {
+                            "No pulses above gate".to_string()
+                        } else {
+                            format!("Detected Call Pulses ({})", pulses.len())
+                        };
+                        ui.label(RichText::new(hdr).strong().color(Color32::from_rgb(226, 232, 240)));
+                        if self.acoustics.selected_pulse_idx.is_some()
+                            && ui.small_button("Clear").clicked()
+                        {
+                            self.acoustics.selected_pulse_idx = None;
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .id_salt("acoustic_pulses_scroll")
+                        .max_height((row_h - 24.0).max(60.0))
+                        .show(ui, |ui| {
+                            egui::Grid::new("acoustic_pulses_grid")
+                                .num_columns(6)
+                                .striped(true)
+                                .spacing([8.0, 3.0])
+                                .show(ui, |ui| {
+                                    for h in ["#", "Start", "Dur", "Fc", "Band", "Peak"] {
+                                        ui.small(RichText::new(h).strong().monospace());
+                                    }
+                                    ui.end_row();
+                                    for (idx, p) in pulses.iter().enumerate() {
+                                        let sel = self.acoustics.selected_pulse_idx == Some(idx);
+                                        if ui
+                                            .selectable_label(sel, format!("P{}", idx + 1))
+                                            .clicked()
+                                        {
+                                            self.acoustics.selected_pulse_idx =
+                                                if sel { None } else { Some(idx) };
+                                        }
+                                        ui.small(
+                                            RichText::new(format!("{:.1}ms", p.start_ms)).monospace(),
+                                        );
+                                        ui.small(
+                                            RichText::new(format!("{:.1}ms", p.duration_ms))
+                                                .monospace(),
+                                        );
+                                        ui.small(
+                                            RichText::new(format!("{:.1}k", p.f_char_khz))
+                                                .monospace()
+                                                .color(Color32::from_rgb(56, 189, 248)),
+                                        );
+                                        ui.small(
+                                            RichText::new(format!(
+                                                "{:.1}-{:.1}",
+                                                p.f_min_khz, p.f_max_khz
+                                            ))
+                                            .monospace(),
+                                        );
+                                        ui.small(
+                                            RichText::new(format!("{:.0}dB", p.peak_dbfs))
+                                                .monospace(),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                },
+            );
+        });
     }
 
     fn paint_batch_sweep_tab(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -2086,6 +2572,16 @@ impl AeroFlywayApp {
 
             ui.label("Smoke:");
             ui.add(egui::TextEdit::singleline(&mut self.batch_ui.smoke_csv).desired_width(68.0));
+
+            if ui.button("Output Folder...").clicked() {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_title("Select Batch Sweep Output Folder")
+                    .pick_folder()
+                {
+                    self.export_dir_input = dir.display().to_string();
+                    self.status_line = format!("Batch sweep export folder -> {}", self.export_dir_input);
+                }
+            }
 
             let btn_lbl = if self.batch_ui.running_sweep {
                 "Running Rayon Sweep..."
@@ -2269,10 +2765,20 @@ impl AeroFlywayApp {
                             let label =
                                 format!("Virtual Stepping-Stone #{}", self.virtual_patch_counter);
                             self.virtual_patch_counter += 1;
-                            let _ = self
+                            match self
                                 .store
-                                .insert_milkweed_patch(&label, lat, lon, 25.0, true, 155.0);
-                            self.milkweed = self.store.load_milkweed_patches();
+                                .insert_milkweed_patch(&label, lat, lon, 25.0, true, 155.0)
+                            {
+                                Ok(_) => {
+                                    self.milkweed = self.store.load_milkweed_patches();
+                                    self.status_line =
+                                        format!("Planted virtual stepping-stone '{label}' at ({lat:.4}, {lon:.4})");
+                                }
+                                Err(err) => {
+                                    self.status_line =
+                                        format!("Failed saving virtual stepping-stone to SQLite: {err}");
+                                }
+                            }
                         }
                     }
                 }
@@ -2320,12 +2826,14 @@ impl AeroFlywayApp {
                 self.paint_hex_choropleth(&painter, canvas_rect);
             }
 
+            let mut label_candidates: Vec<MapLabelCandidate> = Vec::new();
+
             if self.layers.skyglow_domes {
-                self.paint_skyglow_domes(&painter, canvas_rect);
+                self.paint_skyglow_domes(&painter, canvas_rect, &mut label_candidates);
             }
 
             if self.layers.radar_rings {
-                self.paint_radar_stations(&painter, canvas_rect);
+                self.paint_radar_stations(&painter, canvas_rect, &mut label_candidates);
             }
 
             if self.layers.wind_barbs {
@@ -2510,7 +3018,7 @@ impl AeroFlywayApp {
             }
 
             if self.layers.landmarks {
-                self.paint_landmarks(&painter, canvas_rect);
+                self.paint_landmarks(&painter, canvas_rect, &mut label_candidates);
             }
 
             let pa = self.map.lat_lon_to_screen(
@@ -2541,12 +3049,26 @@ impl AeroFlywayApp {
                 Color32::from_rgb(110, 231, 183),
             );
 
-            self.paint_map_hud(&painter, canvas_rect, response.hover_pos());
-            self.paint_taxon_legend_pill(&painter, canvas_rect);
+            let hud_rect = self.paint_map_hud(&painter, canvas_rect, response.hover_pos());
+            let legend_rect = self.paint_taxon_legend_pill(&painter, canvas_rect);
+            let transect_a_rect = Rect::from_min_max(pa + Vec2::new(4.0, -24.0), pa + Vec2::new(24.0, -4.0));
+            let transect_b_rect = Rect::from_min_max(pb + Vec2::new(4.0, -24.0), pb + Vec2::new(24.0, -4.0));
+            self.paint_decluttered_map_labels(
+                &painter,
+                canvas_rect,
+                label_candidates,
+                &[hud_rect, legend_rect, transect_a_rect, transect_b_rect],
+                response.hover_pos(),
+            );
         });
     }
 
-    fn paint_skyglow_domes(&self, painter: &egui::Painter, canvas_rect: Rect) {
+    fn paint_skyglow_domes(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        label_candidates: &mut Vec<MapLabelCandidate>,
+    ) {
         let mpp = self.map.meters_per_pixel().max(10.0);
         for dome in skyglow_domes_for_region(self.params.region) {
             let sp = self.map.lat_lon_to_screen(dome.lat, dome.lon, canvas_rect);
@@ -2577,19 +3099,25 @@ impl AeroFlywayApp {
                 px_r,
                 Stroke::new(1.1, Color32::from_rgba_unmultiplied(251, 191, 36, 130)),
             );
-            if self.map.zoom >= 5.2 {
-                painter.text(
-                    sp + Vec2::new(0.0, -px_r - 4.0),
-                    Align2::CENTER_BOTTOM,
-                    format!("[VIIRS {:.0} nW] {}", eff_nw, dome.city_name),
-                    FontId::monospace(9.5),
-                    Color32::from_rgb(251, 207, 232),
-                );
+            if self.map.zoom >= 5.2 && canvas_rect.contains(sp) {
+                label_candidates.push(MapLabelCandidate {
+                    anchor: sp,
+                    marker_radius_px: (px_r * 0.35).clamp(6.0, 18.0),
+                    priority: 1,
+                    text: format!("[VIIRS {:.0} nW] {}", eff_nw, dome.city_name),
+                    font: FontId::monospace(9.5),
+                    color: Color32::from_rgb(251, 207, 232),
+                });
             }
         }
     }
 
-    fn paint_radar_stations(&self, painter: &egui::Painter, canvas_rect: Rect) {
+    fn paint_radar_stations(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        label_candidates: &mut Vec<MapLabelCandidate>,
+    ) {
         let mpp = self.map.meters_per_pixel().max(10.0);
         for prof in &self.engine.radar_profiles {
             let sp = self.map.lat_lon_to_screen(prof.lat, prof.lon, canvas_rect);
@@ -2603,13 +3131,16 @@ impl AeroFlywayApp {
                 Stroke::new(1.1, Color32::from_rgba_unmultiplied(34, 211, 238, 125)),
             );
             painter.circle_filled(sp, 3.8, Color32::from_rgb(34, 211, 238));
-            painter.text(
-                sp + Vec2::new(6.0, 0.0),
-                Align2::LEFT_CENTER,
-                format!("[RADAR {}] {:.0} MTR", prof.station_code, prof.mtr_birds_km_hr),
-                FontId::monospace(10.0),
-                Color32::from_rgb(103, 232, 249),
-            );
+            if canvas_rect.contains(sp) {
+                label_candidates.push(MapLabelCandidate {
+                    anchor: sp,
+                    marker_radius_px: 5.0,
+                    priority: 0,
+                    text: format!("[RADAR {}] {:.0} MTR", prof.station_code, prof.mtr_birds_km_hr),
+                    font: FontId::monospace(10.0),
+                    color: Color32::from_rgb(103, 232, 249),
+                });
+            }
         }
     }
 
@@ -2636,41 +3167,38 @@ impl AeroFlywayApp {
             painter.add(egui::Shape::line(pts, graticule_stroke));
         }
 
-        if self.params.region == FlywayRegion::PacificAmericas {
-            let draw_poly = |coords: &[(f64, f64)], stroke: Stroke| {
-                let pts: Vec<Pos2> = coords
-                    .iter()
-                    .map(|(lt, ln)| self.map.lat_lon_to_screen(*lt, *ln, canvas_rect))
-                    .collect();
-                painter.add(egui::Shape::line(pts, stroke));
-            };
+        let basemap = vector_basemap_for_region(self.params.region);
+        let draw_poly = |coords: &[(f64, f64)], stroke: Stroke| {
+            let pts: Vec<Pos2> = coords
+                .iter()
+                .map(|(lt, ln)| self.map.lat_lon_to_screen(*lt, *ln, canvas_rect))
+                .collect();
+            painter.add(egui::Shape::line(pts, stroke));
+        };
 
-            for border in STATE_BOUNDARIES {
-                draw_poly(
-                    border,
-                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(100, 116, 139, 135)),
-                );
-            }
+        for border in basemap.borders {
             draw_poly(
-                PACIFIC_COASTLINE,
-                Stroke::new(2.0, Color32::from_rgba_unmultiplied(71, 135, 179, 220)),
+                border,
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(100, 116, 139, 135)),
             );
+        }
+        for (idx, coastline) in basemap.coastlines.iter().enumerate() {
+            let width = if idx == 0 { 2.0 } else { 1.5 };
+            let alpha = if idx == 0 { 220 } else { 185 };
             draw_poly(
-                PUGET_SOUND_RING,
-                Stroke::new(1.4, Color32::from_rgba_unmultiplied(71, 135, 179, 185)),
+                coastline,
+                Stroke::new(width, Color32::from_rgba_unmultiplied(71, 135, 179, alpha)),
             );
-            draw_poly(
-                COLUMBIA_RIVER,
-                Stroke::new(1.8, Color32::from_rgba_unmultiplied(34, 211, 238, 165)),
-            );
-            draw_poly(
-                WILLAMETTE_RIVER,
-                Stroke::new(1.6, Color32::from_rgba_unmultiplied(56, 189, 248, 175)),
-            );
-            draw_poly(
-                KLAMATH_SACRAMENTO_CORRIDOR,
-                Stroke::new(1.2, Color32::from_rgba_unmultiplied(56, 189, 248, 120)),
-            );
+        }
+        for (idx, river) in basemap.rivers.iter().enumerate() {
+            let (width, col) = if idx == 0 {
+                (1.8, Color32::from_rgba_unmultiplied(34, 211, 238, 165))
+            } else if idx == 1 {
+                (1.6, Color32::from_rgba_unmultiplied(56, 189, 248, 175))
+            } else {
+                (1.2, Color32::from_rgba_unmultiplied(56, 189, 248, 125))
+            };
+            draw_poly(river, Stroke::new(width, col));
         }
     }
 
@@ -2724,27 +3252,129 @@ impl AeroFlywayApp {
         }
     }
 
-    fn paint_landmarks(&self, painter: &egui::Painter, canvas_rect: Rect) {
+    fn paint_landmarks(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        label_candidates: &mut Vec<MapLabelCandidate>,
+    ) {
         for lm in landmarks_for_region(self.params.region) {
             let sp = self.map.lat_lon_to_screen(lm.lat, lm.lon, canvas_rect);
             if !canvas_rect.contains(sp) {
                 continue;
             }
-            let (col, prefix) = match lm.kind {
-                LandmarkKind::WildlifeRefuge => (Color32::from_rgb(74, 222, 128), "NWR"),
-                LandmarkKind::MotusStation => (Color32::from_rgb(34, 211, 238), "MOTUS"),
-                LandmarkKind::MonarchSanctuary => (Color32::from_rgb(251, 191, 36), "ROOST"),
-                LandmarkKind::CascadePeak => (Color32::from_rgb(203, 213, 225), "PEAK"),
+            let (col, prefix, prio) = match lm.kind {
+                LandmarkKind::WildlifeRefuge => (Color32::from_rgb(74, 222, 128), "NWR", 2),
+                LandmarkKind::MotusStation => (Color32::from_rgb(34, 211, 238), "MOTUS", 2),
+                LandmarkKind::MonarchSanctuary => (Color32::from_rgb(251, 191, 36), "ROOST", 2),
+                LandmarkKind::CascadePeak => (Color32::from_rgb(203, 213, 225), "PEAK", 3),
             };
             painter.circle_stroke(sp, 4.5, Stroke::new(1.4, col));
             if self.map.zoom >= 5.2 {
-                painter.text(
-                    sp + Vec2::new(7.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    format!("[{prefix}] {}", lm.name),
-                    FontId::proportional(11.0),
-                    col,
+                label_candidates.push(MapLabelCandidate {
+                    anchor: sp,
+                    marker_radius_px: 5.5,
+                    priority: prio,
+                    text: format!("[{prefix}] {}", lm.name),
+                    font: FontId::proportional(11.0),
+                    color: col,
+                });
+            }
+        }
+    }
+
+    fn paint_decluttered_map_labels(
+        &self,
+        painter: &egui::Painter,
+        canvas_rect: Rect,
+        candidates: Vec<MapLabelCandidate>,
+        reserved_rects: &[Rect],
+        hover_pos: Option<Pos2>,
+    ) {
+        let mut placer = MapLabelPlacer::new(canvas_rect);
+        for &r in reserved_rects {
+            placer.reserve_rect(r);
+        }
+
+        let mut indexed: Vec<(usize, MapLabelCandidate)> =
+            candidates.into_iter().enumerate().collect();
+        indexed.sort_by_key(|(idx, c)| (c.priority, *idx));
+
+        let mut skipped_for_hover: Vec<(Pos2, std::sync::Arc<egui::Galley>, Color32, Vec2)> =
+            Vec::new();
+
+        for (_, cand) in indexed {
+            let galley = painter.layout_no_wrap(cand.text, cand.font, cand.color);
+            let box_size = galley.size() + Vec2::new(10.0, 4.0);
+            if let Some(pill_rect) =
+                placer.try_place(cand.anchor, cand.marker_radius_px, box_size)
+            {
+                let delta = pill_rect.center() - cand.anchor;
+                if delta.length() > 12.0 {
+                    let edge_pt = Pos2::new(
+                        cand.anchor.x.clamp(pill_rect.left(), pill_rect.right()),
+                        cand.anchor.y.clamp(pill_rect.top(), pill_rect.bottom()),
+                    );
+                    painter.line_segment(
+                        [cand.anchor, edge_pt],
+                        Stroke::new(
+                            0.8,
+                            Color32::from_rgba_unmultiplied(
+                                cand.color.r(),
+                                cand.color.g(),
+                                cand.color.b(),
+                                135,
+                            ),
+                        ),
+                    );
+                }
+                painter.rect_filled(
+                    pill_rect,
+                    CornerRadius::same(4),
+                    Color32::from_rgba_unmultiplied(11, 17, 27, 205),
                 );
+                painter.rect_stroke(
+                    pill_rect,
+                    CornerRadius::same(4),
+                    Stroke::new(
+                        0.8,
+                        Color32::from_rgba_unmultiplied(
+                            cand.color.r(),
+                            cand.color.g(),
+                            cand.color.b(),
+                            110,
+                        ),
+                    ),
+                    StrokeKind::Inside,
+                );
+                painter.galley(pill_rect.min + Vec2::new(5.0, 2.0), galley, cand.color);
+            } else {
+                skipped_for_hover.push((cand.anchor, galley, cand.color, box_size));
+            }
+        }
+
+        if let Some(hp) = hover_pos {
+            for (anchor, galley, color, box_size) in skipped_for_hover {
+                if anchor.distance(hp) <= 12.0 {
+                    let pill_pos = Pos2::new(
+                        (anchor.x + 10.0).min(canvas_rect.right() - box_size.x - 6.0),
+                        (anchor.y - box_size.y - 6.0).max(canvas_rect.top() + 6.0),
+                    );
+                    let pill_rect = Rect::from_min_size(pill_pos, box_size);
+                    painter.rect_filled(
+                        pill_rect,
+                        CornerRadius::same(4),
+                        Color32::from_rgba_unmultiplied(15, 23, 42, 240),
+                    );
+                    painter.rect_stroke(
+                        pill_rect,
+                        CornerRadius::same(4),
+                        Stroke::new(1.0, color),
+                        StrokeKind::Inside,
+                    );
+                    painter.galley(pill_rect.min + Vec2::new(5.0, 2.0), galley, color);
+                    break;
+                }
             }
         }
     }
@@ -2754,7 +3384,7 @@ impl AeroFlywayApp {
         painter: &egui::Painter,
         canvas_rect: Rect,
         hover_pos: Option<Pos2>,
-    ) {
+    ) -> Rect {
         let mpp = self.map.meters_per_pixel();
         let target_km = if mpp * 110.0 > 100_000.0 {
             200.0
@@ -2821,9 +3451,10 @@ impl AeroFlywayApp {
                 Color32::from_rgb(148, 163, 184),
             );
         }
+        hud_rect
     }
 
-    fn paint_taxon_legend_pill(&self, painter: &egui::Painter, canvas_rect: Rect) {
+    fn paint_taxon_legend_pill(&self, painter: &egui::Painter, canvas_rect: Rect) -> Rect {
         let pill_w = 248.0_f32;
         let pill_h = 74.0_f32;
         let pill_rect = Rect::from_min_size(
@@ -2882,7 +3513,17 @@ impl AeroFlywayApp {
                 Color32::from_rgb(226, 232, 240),
             );
         }
+        pill_rect
     }
+}
+
+struct MapLabelCandidate {
+    anchor: Pos2,
+    marker_radius_px: f32,
+    priority: u8,
+    text: String,
+    font: FontId,
+    color: Color32,
 }
 
 impl AeroFlywayApp {
@@ -2921,6 +3562,7 @@ impl AeroFlywayApp {
 
         self.render_native_menu_bar(ctx);
         self.render_help_modal(ctx);
+        self.render_about_modal(ctx);
 
         match self.stage {
             AppStage::StartupHub => {
@@ -3303,8 +3945,20 @@ fn run_headless_screenshot(out_path: &std::path::Path, view: u8) -> Result<(), S
                 .map_err(|e| format!("Failed to create output directory: {e}"))?;
         }
     }
-    image::save_buffer(out_path, &rgba, WIDTH, HEIGHT, image::ColorType::Rgba8)
-        .map_err(|e| format!("Failed to write PNG screenshot: {e}"))?;
+    {
+        use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+        use image::ImageEncoder;
+        let file = std::fs::File::create(out_path)
+            .map_err(|e| format!("Failed to create PNG screenshot: {e}"))?;
+        let encoder = PngEncoder::new_with_quality(
+            std::io::BufWriter::new(file),
+            CompressionType::Best,
+            FilterType::Adaptive,
+        );
+        encoder
+            .write_image(&rgba, WIDTH, HEIGHT, image::ExtendedColorType::Rgba8)
+            .map_err(|e| format!("Failed to write PNG screenshot: {e}"))?;
+    }
 
     let _ = std::fs::remove_file(&temp_db);
     let _ = std::fs::remove_file(format!("{}-wal", temp_db.display()));
@@ -3313,7 +3967,36 @@ fn run_headless_screenshot(out_path: &std::path::Path, view: u8) -> Result<(), S
     Ok(())
 }
 
+#[cfg(windows)]
+fn attach_parent_console_if_cli() {
+    if std::env::args_os().len() > 1 {
+        // SAFETY: Win32 AttachConsole(ATTACH_PARENT_PROCESS) binds stdout/stderr to an
+        // existing parent terminal when CLI arguments are present and is a no-op otherwise.
+        unsafe {
+            let _ = windows_sys::Win32::System::Console::AttachConsole(
+                windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console_if_cli() {}
+
+fn load_embedded_app_icon() -> Option<Arc<egui::IconData>> {
+    const ICON_PNG: &[u8] = include_bytes!("../assets/aeroflyway_icon_64.png");
+    let img = image::load_from_memory(ICON_PNG).ok()?.into_rgba8();
+    let (width, height) = img.dimensions();
+    Some(Arc::new(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    }))
+}
+
 fn main() -> eframe::Result<()> {
+    attach_parent_console_if_cli();
+
     let skip_hub = match try_dispatch_cli() {
         Ok(CliDispatchOutcome::HandledExit) => return Ok(()),
         Ok(CliDispatchOutcome::Screenshot { out_path, view }) => {
@@ -3334,14 +4017,19 @@ fn main() -> eframe::Result<()> {
         }
     };
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1580.0, 980.0])
+        .with_min_inner_size([1040.0, 700.0])
+        .with_drag_and_drop(true)
+        .with_title(
+            "AeroFlyway v0.6 — Startup Hub, VIIRS Lights-Out, NEXRAD/Aloft VPTS & WAV STFT",
+        );
+    if let Some(icon) = load_embedded_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1580.0, 980.0])
-            .with_min_inner_size([1040.0, 700.0])
-            .with_drag_and_drop(true)
-            .with_title(
-                "AeroFlyway v0.6 — Startup Hub, VIIRS Lights-Out, NEXRAD/Aloft VPTS & WAV STFT",
-            ),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         multisampling: 0,
         depth_buffer: 0,

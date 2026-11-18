@@ -296,6 +296,237 @@ pub const STATE_BOUNDARIES: &[&[(f64, f64)]] = &[
     &[(45.918, -119.328), (46.000, -118.980), (46.000, -116.916)],
 ];
 
+// Central & Mississippi Flyway (Platte / Bracken / Gulf)
+pub const GULF_TEXAS_LOUISIANA_COASTLINE: &[(f64, f64)] = &[
+    (25.950, -97.140), (26.580, -97.290), (27.800, -97.070), (28.230, -96.800),
+    (28.580, -95.980), (29.330, -94.750), (29.700, -93.870), (29.550, -91.850),
+    (29.150, -89.250),
+];
+
+pub const PLATTE_RIVER: &[(f64, f64)] = &[
+    (41.130, -100.760), (40.670, -98.890), (40.910, -98.330), (41.410, -97.360),
+    (41.050, -95.880),
+];
+
+pub const MISSOURI_RIVER: &[(f64, f64)] = &[
+    (46.810, -100.820), (44.360, -100.350), (42.870, -97.390), (42.490, -96.420),
+    (41.250, -95.920), (39.110, -94.590),
+];
+
+pub const ARKANSAS_RIVER: &[(f64, f64)] = &[
+    (38.050, -102.040), (37.750, -100.020), (38.350, -98.760), (37.680, -97.340),
+    (36.150, -95.990), (35.390, -94.430),
+];
+
+pub const RED_RIVER_CENTRAL: &[(f64, f64)] = &[
+    (34.380, -99.800), (34.100, -98.500), (33.850, -96.600), (33.650, -94.050),
+];
+
+pub const RIO_GRANDE_LOWER: &[(f64, f64)] = &[
+    (29.360, -100.900), (27.500, -99.510), (25.950, -97.140),
+];
+
+pub const CENTRAL_STATE_BORDERS: &[&[(f64, f64)]] = &[
+    &[(40.000, -104.000), (40.000, -95.310)],
+    &[(37.000, -103.000), (37.000, -94.620)],
+    &[(43.000, -104.000), (43.000, -98.500)],
+    &[(45.940, -104.000), (45.940, -96.560)],
+    &[(36.500, -103.000), (36.500, -100.000), (34.560, -100.000)],
+];
+
+// Atlantic Americas Flyway (Cape May / Delaware / Chesapeake / Florida)
+pub const ATLANTIC_US_COASTLINE: &[(f64, f64)] = &[
+    (25.140, -80.930), (25.770, -80.130), (28.450, -80.530), (30.390, -81.410),
+    (32.030, -80.840), (32.760, -79.870), (33.840, -77.960), (34.600, -76.530),
+    (35.250, -75.530), (35.770, -75.530), (36.930, -76.000), (38.330, -75.080),
+    (38.790, -75.090),
+];
+
+pub const ATLANTIC_NORTH_COASTLINE: &[(f64, f64)] = &[
+    (38.930, -74.960), (39.360, -74.420), (40.470, -74.000), (40.580, -73.950),
+    (41.070, -71.860), (41.670, -69.950), (42.360, -71.050), (43.660, -70.250),
+    (44.800, -67.000),
+];
+
+pub const CHESAPEAKE_BAY_RING: &[(f64, f64)] = &[
+    (37.130, -75.980), (38.440, -76.120), (38.980, -76.480), (39.550, -76.090),
+    (39.270, -76.580), (37.980, -76.240), (36.930, -76.000),
+];
+
+pub const DELAWARE_BAY_RING: &[(f64, f64)] = &[
+    (38.790, -75.090), (39.720, -75.520), (38.930, -74.960),
+];
+
+pub const HUDSON_RIVER: &[(f64, f64)] = &[
+    (40.700, -74.020), (41.700, -73.940), (42.650, -73.750), (43.310, -73.640),
+];
+
+pub const DELAWARE_RIVER: &[(f64, f64)] = &[
+    (39.720, -75.520), (40.220, -74.770), (40.970, -75.140), (41.950, -75.280),
+];
+
+pub const SUSQUEHANNA_RIVER: &[(f64, f64)] = &[
+    (39.550, -76.090), (40.260, -76.890), (40.860, -76.800), (41.250, -75.880),
+];
+
+pub const POTOMAC_RIVER: &[(f64, f64)] = &[
+    (37.980, -76.240), (38.880, -77.040), (39.320, -77.730),
+];
+
+pub const ATLANTIC_STATE_BORDERS: &[&[(f64, f64)]] = &[
+    &[(39.720, -79.480), (39.720, -75.790)],
+    &[(42.000, -79.760), (42.000, -75.360)],
+];
+
+// East Atlantic Palearctic Flyway (Falsterbo / Wadden / Donana / Gibraltar)
+pub const EUROPE_ATLANTIC_COASTLINE: &[(f64, f64)] = &[
+    (36.010, -5.600), (36.850, -6.450), (37.020, -8.990), (38.700, -9.420),
+    (41.150, -8.680), (42.880, -9.270), (43.550, -5.660), (43.350, -3.020),
+    (43.480, -1.560), (45.580, -1.070), (47.270, -2.210), (48.390, -4.490),
+    (49.650, -1.620), (50.960, 1.850), (51.230, 2.910), (51.980, 4.100),
+    (52.960, 4.760), (53.330, 6.920), (53.870, 8.700), (55.470, 8.430),
+    (57.730, 10.620), (55.680, 12.600),
+];
+
+pub const EUROPE_MED_COASTLINE: &[(f64, f64)] = &[
+    (36.130, -5.350), (36.710, -4.420), (36.830, -2.460), (39.460, -0.320),
+    (40.720, 0.850), (41.380, 2.180), (43.290, 5.360), (43.690, 7.260),
+    (44.400, 8.930),
+];
+
+pub const GREAT_BRITAIN_COASTLINE: &[(f64, f64)] = &[
+    (50.070, -5.710), (50.360, -4.140), (51.120, 1.320), (51.950, 1.290),
+    (53.740, -0.330), (55.950, -3.180), (51.450, -3.180), (53.310, -4.630),
+    (50.070, -5.710),
+];
+
+pub const SCANDINAVIA_SOUTH_COAST: &[(f64, f64)] = &[
+    (55.380, 12.820), (55.430, 13.820), (57.710, 11.970),
+];
+
+pub const MOROCCO_STRAIT_COAST: &[(f64, f64)] = &[
+    (34.030, -6.840), (35.780, -5.810), (35.890, -5.300), (35.290, -2.940),
+];
+
+pub const RHINE_RIVER: &[(f64, f64)] = &[
+    (51.980, 4.100), (51.840, 5.140), (50.940, 6.960), (50.000, 8.270),
+    (47.560, 7.590),
+];
+
+pub const LOIRE_RIVER: &[(f64, f64)] = &[
+    (47.270, -2.210), (47.390, 0.690), (47.900, 1.900), (46.990, 3.160),
+];
+
+pub const GARONNE_RIVER: &[(f64, f64)] = &[
+    (45.580, -1.070), (44.840, -0.580), (43.600, 1.440),
+];
+
+pub const GUADALQUIVIR_RIVER: &[(f64, f64)] = &[
+    (36.790, -6.360), (37.390, -5.990), (37.880, -4.780),
+];
+
+pub const PYRENEES_BORDER: &[&[(f64, f64)]] = &[
+    &[(43.360, -1.790), (42.800, -0.400), (42.430, 3.170)],
+];
+
+// East Asian-Australasian Flyway (Bohai / Yellow Sea / Yangtze / Poyang)
+pub const EAST_ASIA_MAINLAND_COASTLINE: &[(f64, f64)] = &[
+    (40.620, 122.150), (39.930, 119.600), (39.040, 118.520), (39.000, 117.720),
+    (37.750, 119.180), (37.540, 121.390), (37.510, 122.120), (36.070, 120.380),
+    (34.760, 119.450), (33.380, 120.720), (31.520, 121.920), (30.300, 121.200),
+    (29.880, 121.850), (27.990, 120.800), (26.070, 119.650), (24.480, 118.100),
+    (23.350, 116.700), (22.280, 114.150), (21.200, 110.400),
+];
+
+pub const LIAODONG_KOREA_WEST_COAST: &[(f64, f64)] = &[
+    (40.620, 122.150), (38.910, 121.610), (39.950, 124.300), (37.450, 126.600),
+    (34.790, 126.380),
+];
+
+pub const YANGTZE_RIVER: &[(f64, f64)] = &[
+    (31.520, 121.920), (32.060, 118.780), (29.740, 116.220), (30.580, 114.280),
+    (30.700, 111.290), (29.560, 106.550),
+];
+
+pub const POYANG_BASIN_LOOP: &[(f64, f64)] = &[
+    (29.740, 116.220), (29.350, 116.050), (28.880, 116.280), (29.150, 116.550),
+    (29.740, 116.220),
+];
+
+pub const YELLOW_RIVER: &[(f64, f64)] = &[
+    (37.750, 119.180), (36.730, 117.000), (34.910, 113.650), (34.610, 110.280),
+    (36.060, 103.830),
+];
+
+pub const ORKHON_UGII_RIVER: &[(f64, f64)] = &[
+    (47.760, 102.650), (48.800, 104.800),
+];
+
+pub const CHINA_MONGOLIA_BORDER: &[&[(f64, f64)]] = &[
+    &[(44.500, 102.200), (42.500, 106.500), (43.800, 111.900), (45.500, 116.500), (47.900, 119.800)],
+];
+
+/// Offline vector geography (coastlines, major river corridors, and political boundaries)
+/// bundled per [`FlywayRegion`] so every global corridor renders cleanly without raster tiles.
+#[derive(Clone, Copy, Debug)]
+pub struct VectorBasemapLayer {
+    pub coastlines: &'static [&'static [(f64, f64)]],
+    pub rivers: &'static [&'static [(f64, f64)]],
+    pub borders: &'static [&'static [(f64, f64)]],
+}
+
+pub fn vector_basemap_for_region(region: FlywayRegion) -> VectorBasemapLayer {
+    match region {
+        FlywayRegion::PacificAmericas => VectorBasemapLayer {
+            coastlines: &[PACIFIC_COASTLINE, PUGET_SOUND_RING],
+            rivers: &[COLUMBIA_RIVER, WILLAMETTE_RIVER, KLAMATH_SACRAMENTO_CORRIDOR],
+            borders: STATE_BOUNDARIES,
+        },
+        FlywayRegion::CentralAmericasPlatte => VectorBasemapLayer {
+            coastlines: &[GULF_TEXAS_LOUISIANA_COASTLINE],
+            rivers: &[
+                PLATTE_RIVER,
+                MISSOURI_RIVER,
+                ARKANSAS_RIVER,
+                RED_RIVER_CENTRAL,
+                RIO_GRANDE_LOWER,
+            ],
+            borders: CENTRAL_STATE_BORDERS,
+        },
+        FlywayRegion::AtlanticAmericas => VectorBasemapLayer {
+            coastlines: &[
+                ATLANTIC_US_COASTLINE,
+                ATLANTIC_NORTH_COASTLINE,
+                CHESAPEAKE_BAY_RING,
+                DELAWARE_BAY_RING,
+            ],
+            rivers: &[HUDSON_RIVER, DELAWARE_RIVER, SUSQUEHANNA_RIVER, POTOMAC_RIVER],
+            borders: ATLANTIC_STATE_BORDERS,
+        },
+        FlywayRegion::EastAtlanticPalearctic => VectorBasemapLayer {
+            coastlines: &[
+                EUROPE_ATLANTIC_COASTLINE,
+                EUROPE_MED_COASTLINE,
+                GREAT_BRITAIN_COASTLINE,
+                SCANDINAVIA_SOUTH_COAST,
+                MOROCCO_STRAIT_COAST,
+            ],
+            rivers: &[RHINE_RIVER, LOIRE_RIVER, GARONNE_RIVER, GUADALQUIVIR_RIVER],
+            borders: PYRENEES_BORDER,
+        },
+        FlywayRegion::EastAsianAustralasian => VectorBasemapLayer {
+            coastlines: &[EAST_ASIA_MAINLAND_COASTLINE, LIAODONG_KOREA_WEST_COAST],
+            rivers: &[
+                YANGTZE_RIVER,
+                POYANG_BASIN_LOOP,
+                YELLOW_RIVER,
+                ORKHON_UGII_RIVER,
+            ],
+            borders: CHINA_MONGOLIA_BORDER,
+        },
+    }
+}
+
 pub const FLYWAY_LANDMARKS: &[FlywayLandmark] = &[
     FlywayLandmark { name: "William L. Finley NWR", lat: 44.4128, lon: -123.3285, elevation_m: 86.0, kind: LandmarkKind::WildlifeRefuge },
     FlywayLandmark { name: "Baskett Slough NWR", lat: 44.9658, lon: -123.2575, elevation_m: 65.0, kind: LandmarkKind::WildlifeRefuge },

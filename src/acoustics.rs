@@ -99,6 +99,8 @@ pub struct SpectrogramResult {
     pub scientific_hint: String,
 }
 
+pub const SPECTROGRAM_DB_CEIL: f32 = -2.0;
+
 impl SpectrogramResult {
     /// Converts the dBFS spectrogram matrix up to `view_max_khz` into an RGBA `ColorImage`
     /// (width = `num_frames`, height = displayed frequency bins, row 0 = highest frequency).
@@ -107,15 +109,25 @@ impl SpectrogramResult {
             return ColorImage::from_rgba_unmultiplied([1, 1], &[12, 18, 28, 255]);
         }
 
-        let nyquist = self.max_freq_khz.max(1.0);
-        let clamped_top_khz = view_max_khz.clamp(2.0, nyquist);
+        let nyquist = if self.max_freq_khz.is_finite() {
+            self.max_freq_khz.max(0.5)
+        } else {
+            0.5
+        };
+        let min_khz = nyquist.min(2.0);
+        let sanitized_top = if view_max_khz.is_finite() {
+            view_max_khz
+        } else {
+            nyquist
+        };
+        let clamped_top_khz = sanitized_top.clamp(min_khz, nyquist);
         let max_bin = (((clamped_top_khz / nyquist) * (self.num_bins as f64)).ceil() as usize)
-            .clamp(8, self.num_bins);
+            .clamp(8.min(self.num_bins), self.num_bins);
 
         let width = self.num_frames;
         let height = max_bin;
         let mut rgba = vec![0_u8; width * height * 4];
-        let db_ceil = -2.0_f32;
+        let db_ceil = SPECTROGRAM_DB_CEIL;
         let span = (db_ceil - db_floor).max(6.0);
 
         for row in 0..height {
@@ -140,8 +152,18 @@ impl SpectrogramResult {
         if self.num_frames == 0 || self.num_bins == 0 {
             return (0.0, 0.0, -100.0);
         }
-        let nyquist = self.max_freq_khz.max(1.0);
-        let top_khz = view_max_khz.clamp(2.0, nyquist);
+        let nyquist = if self.max_freq_khz.is_finite() {
+            self.max_freq_khz.max(0.5)
+        } else {
+            0.5
+        };
+        let min_khz = nyquist.min(2.0);
+        let sanitized_top = if view_max_khz.is_finite() {
+            view_max_khz
+        } else {
+            nyquist
+        };
+        let top_khz = sanitized_top.clamp(min_khz, nyquist);
         let time_ms = (norm_x.clamp(0.0, 1.0) as f64) * self.duration_ms;
         let freq_khz = (1.0 - norm_y_from_top.clamp(0.0, 1.0) as f64) * top_khz;
 
@@ -338,6 +360,42 @@ pub fn write_wav_16bit(
 
     fs::write(path.as_ref(), buf)
         .map_err(|e| format!("Failed writing {}: {e}", path.as_ref().display()))
+}
+
+/// Builds a time-expanded copy of `recording` with header sample rate divided by `expansion_factor`
+/// (typically `10` for ultrasonic bat passes, shifting e.g. 250 kHz -> 25 kHz and 40 kHz -> 4 kHz).
+pub fn make_time_expanded_recording(
+    recording: &WavRecording,
+    expansion_factor: u32,
+) -> WavRecording {
+    let factor = expansion_factor.max(1);
+    let expanded_sr = (recording.sample_rate_hz / factor).max(1000);
+    let stem = recording
+        .source_label
+        .strip_suffix(".wav")
+        .or_else(|| recording.source_label.strip_suffix(".WAV"))
+        .unwrap_or(&recording.source_label);
+    WavRecording {
+        source_label: format!("{stem}_{factor}x_audible.wav"),
+        sample_rate_hz: expanded_sr,
+        channels: 1,
+        bits_per_sample: 16,
+        samples_mono: recording.samples_mono.clone(),
+        guano_lat_lon: recording.guano_lat_lon,
+    }
+}
+
+/// Writes a time-expanded 16-bit mono PCM `.wav` file (`sample_rate_hz / expansion_factor`),
+/// returning the expanded output sample rate in Hz.
+pub fn write_time_expanded_wav_16bit(
+    path: impl AsRef<Path>,
+    recording: &WavRecording,
+    expansion_factor: u32,
+    coords: Option<(f64, f64)>,
+) -> Result<u32, String> {
+    let expanded = make_time_expanded_recording(recording, expansion_factor);
+    write_wav_16bit(path, &expanded, coords)?;
+    Ok(expanded.sample_rate_hz)
 }
 
 fn parse_guano_coordinates(body: &[u8]) -> Option<(f64, f64)> {
@@ -589,6 +647,7 @@ pub fn compute_stft_spectrogram(rec: &WavRecording, fft_size: usize) -> Spectrog
     }
 
     let frame_dt_ms = (effective_hop as f64 * 1000.0) / sr;
+    let rec_dur_ms = rec.duration_ms();
     let mut pulses = Vec::new();
     let mut idx = 0usize;
     while idx < frames {
@@ -616,9 +675,14 @@ pub fn compute_stft_spectrogram(rec: &WavRecording, fft_size: usize) -> Spectrog
                         pk_db = pk_db.max(power_dbfs[f_i * num_bins + b] as f64);
                     }
                 }
+                let start_ms = (p_start as f64 * frame_dt_ms).min(rec_dur_ms);
+                let max_dur_ms = (rec_dur_ms - start_ms).max(0.0);
+                let duration_ms = ((p_end - p_start) as f64 * frame_dt_ms)
+                    .max(frame_dt_ms)
+                    .min(max_dur_ms);
                 pulses.push(CallPulse {
-                    start_ms: p_start as f64 * frame_dt_ms,
-                    duration_ms: ((p_end - p_start) as f64 * frame_dt_ms).max(frame_dt_ms),
+                    start_ms,
+                    duration_ms,
                     f_max_khz: f_max,
                     f_min_khz: f_min,
                     f_char_khz: f_char,
@@ -765,7 +829,10 @@ pub fn fft_radix2_inplace(re: &mut [f64], im: &mut [f64]) {
     }
 }
 
-fn magma_lut(t: f32) -> (u8, u8, u8) {
+pub fn magma_lut(t: f32) -> (u8, u8, u8) {
+    if !t.is_finite() {
+        return (8, 11, 24);
+    }
     let stops: &[(f32, [f32; 3])] = &[
         (0.00, [8.0, 11.0, 24.0]),
         (0.25, [59.0, 15.0, 112.0]),
