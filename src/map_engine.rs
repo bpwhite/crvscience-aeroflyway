@@ -81,7 +81,6 @@ pub struct TileKey {
 }
 
 struct DecodedTile {
-    key: TileKey,
     width: usize,
     height: usize,
     rgba: Vec<u8>,
@@ -503,14 +502,12 @@ fn spawn_tile_worker(
                     let rgba8 = dyn_img.to_rgba8();
                     let (w, h) = rgba8.dimensions();
                     DecodedTile {
-                        key,
                         width: w as usize,
                         height: h as usize,
                         rgba: rgba8.into_raw(),
                     }
                 }
                 None => DecodedTile {
-                    key,
                     width: 0,
                     height: 0,
                     rgba: Vec::new(),

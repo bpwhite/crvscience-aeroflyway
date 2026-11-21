@@ -1092,7 +1092,7 @@ fn run_cli_sync(args: &[String]) -> Result<(), String> {
     println!("[AeroFlyway v0.6 Sync] {}", payload.status_summary);
 
     let store = FlywayStore::open(&db_path)?;
-    let _ = store.switch_region_seed(region);
+    store.switch_region_seed(region)?;
     if !payload.observations.is_empty() {
         let n = store.upsert_observations(&payload.observations)?;
         println!("[AeroFlyway v0.6 Sync] Upserted {n} public observation record(s).");
@@ -1115,7 +1115,7 @@ fn run_cli_sync(args: &[String]) -> Result<(), String> {
                 )
             })
             .collect();
-        let _ = store.upsert_radar_bins(&prof.station_code, &prof.observed_at, &rows);
+        store.upsert_radar_bins(&prof.station_code, &prof.observed_at, &rows)?;
     }
 
     if let Some(dir) = export_dir {

@@ -733,7 +733,7 @@ pub fn compute_stft_spectrogram(rec: &WavRecording, fft_size: usize) -> Spectrog
 fn classify_bioacoustic_guild(
     fc_khz: f64,
     fmax_khz: f64,
-    fmin_khz: f64,
+    _fmin_khz: f64,
     dur_ms: f64,
 ) -> (Taxon, String, String) {
     if fc_khz >= 35.0 || fmax_khz >= 55.0 {

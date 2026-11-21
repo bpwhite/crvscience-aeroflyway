@@ -247,7 +247,7 @@ impl FlywayStore {
         self.conn
             .execute(
                 "INSERT INTO workspace_campaigns (id, campaign_name, region_code, doy, cmip6_code, lights_out_pct, updated_at)
-                 VALUES (1, ?1, ?2, ?3, ?4, ?5, '2026-11-14T04:10Z')
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
                  ON CONFLICT(id) DO UPDATE SET
                     campaign_name = excluded.campaign_name,
                     region_code = excluded.region_code,
@@ -637,4 +637,41 @@ pub fn baseline_observations_for_region(region: FlywayRegion) -> Vec<Observation
             },
         )
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_campaign_metadata_writes_live_utc_timestamp() {
+        let db_path = std::env::temp_dir().join(format!(
+            "aeroflyway_campaign_utc_test_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+
+        let store = FlywayStore::open(&db_path).expect("open temp store");
+        store
+            .save_campaign_metadata(
+                "Autumn Nocturnal Test",
+                FlywayRegion::PacificAmericas,
+                278.0,
+                "ssp245",
+                85.0,
+            )
+            .expect("save campaign metadata");
+
+        let summary = store.load_campaign_summary("temp.db");
+        assert_eq!(summary.campaign_name, "Autumn Nocturnal Test");
+        assert_ne!(summary.updated_at, "2026-11-14T04:10Z");
+        assert_eq!(summary.updated_at.len(), 20, "expected YYYY-MM-DDTHH:MM:SSZ, got {}", summary.updated_at);
+        assert!(summary.updated_at.ends_with('Z'));
+        assert_eq!(&summary.updated_at[10..11], "T");
+
+        drop(store);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+    }
 }

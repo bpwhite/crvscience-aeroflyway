@@ -52,7 +52,7 @@ use aeroflyway::ingest::{
     build_regional_radar_profiles, load_vpts_csv_file, spawn_live_ingest, Cmip6Scenario,
     IngestPayload,
 };
-use aeroflyway::map_engine::{haversine_km, BasemapProvider, MapLabelPlacer, MapViewport};
+use aeroflyway::map_engine::{BasemapProvider, MapLabelPlacer, MapViewport};
 use aeroflyway::physics::{
     compute_gpu_scale_factor, compute_lights_out_collision_reduction_pct,
     default_synoptic_nodes_for_region, effective_skyglow_radiance_nw, AeroPhysicsEngine,
@@ -481,8 +481,51 @@ impl AeroFlywayApp {
         };
     }
 
+    fn save_active_campaign_metadata(&mut self) {
+        match self.store.save_campaign_metadata(
+            &self.campaign_name_input,
+            self.params.region,
+            self.params.day_of_year,
+            self.params.cmip6_scenario.code(),
+            self.params.lights_out_curfew_pct,
+        ) {
+            Ok(()) => {
+                self.active_campaign = self
+                    .store
+                    .load_campaign_summary(&self.campaign_db_path_input);
+                self.status_line = format!(
+                    "Saved campaign '{}' into {}",
+                    self.campaign_name_input, self.campaign_db_path_input
+                );
+            }
+            Err(err) => {
+                self.status_line = format!("Failed saving campaign metadata to SQLite: {err}");
+            }
+        }
+    }
+
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
+        let wants_kb = ctx.wants_keyboard_input();
+        let (esc_pressed, save_pressed) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::S),
+            )
+        });
+        if esc_pressed {
+            if self.show_about_modal {
+                self.show_about_modal = false;
+            } else if self.show_help_modal {
+                self.show_help_modal = false;
+            } else if !wants_kb {
+                self.tool_mode = MapToolMode::PanAndInspect;
+                self.transect_drag_anchor = None;
+            }
+        }
+        if save_pressed {
+            self.save_active_campaign_metadata();
+        }
+        if wants_kb {
             return;
         }
         ctx.input(|i| {
@@ -527,21 +570,32 @@ impl AeroFlywayApp {
                 if ext == "csv" {
                     let stations = radar_stations_for_region(self.params.region);
                     if let Some(st) = stations.first() {
-                        if let Ok(prof) = load_vpts_csv_file(path, st) {
-                            self.status_line = format!(
-                                "Imported VPTS radar profile '{}' ({:.0} birds/km/hr MTR)",
-                                prof.station_code, prof.mtr_birds_km_hr
-                            );
-                            if self.engine.radar_profiles.is_empty() {
-                                self.engine.radar_profiles.push(prof);
-                            } else {
-                                self.engine.radar_profiles[0] = prof;
+                        match load_vpts_csv_file(path, st) {
+                            Ok(prof) => {
+                                self.status_line = format!(
+                                    "Imported VPTS radar profile '{}' ({:.0} birds/km/hr MTR)",
+                                    prof.station_code, prof.mtr_birds_km_hr
+                                );
+                                if self.engine.radar_profiles.is_empty() {
+                                    self.engine.radar_profiles.push(prof);
+                                } else {
+                                    self.engine.radar_profiles[0] = prof;
+                                }
+                                self.selected_radar_idx = 0;
+                                self.stage = AppStage::Workbench;
+                                self.bottom_tab = BottomDockTab::RadarVerticalProfile;
+                                return;
                             }
-                            self.selected_radar_idx = 0;
-                            self.stage = AppStage::Workbench;
-                            self.bottom_tab = BottomDockTab::RadarVerticalProfile;
-                            return;
+                            Err(err) => {
+                                self.status_line = format!("VPTS CSV load error: {err}");
+                                return;
+                            }
                         }
+                    } else {
+                        self.status_line =
+                            "VPTS CSV load error: no radar station configured for region"
+                                .to_string();
+                        return;
                     }
                 }
                 match load_wav_file(path) {
@@ -740,28 +794,8 @@ impl AeroFlywayApp {
                         self.stage = AppStage::StartupHub;
                         ui.close_menu();
                     }
-                    if ui.button("Save Campaign Metadata to SQLite").clicked() {
-                        match self.store.save_campaign_metadata(
-                            &self.campaign_name_input,
-                            self.params.region,
-                            self.params.day_of_year,
-                            self.params.cmip6_scenario.code(),
-                            self.params.lights_out_curfew_pct,
-                        ) {
-                            Ok(()) => {
-                                self.active_campaign = self
-                                    .store
-                                    .load_campaign_summary(&self.campaign_db_path_input);
-                                self.status_line = format!(
-                                    "Saved campaign '{}' into {}",
-                                    self.campaign_name_input, self.campaign_db_path_input
-                                );
-                            }
-                            Err(err) => {
-                                self.status_line =
-                                    format!("Failed saving campaign metadata to SQLite: {err}");
-                            }
-                        }
+                    if ui.button("Save Campaign Metadata to SQLite (Ctrl+S)").clicked() {
+                        self.save_active_campaign_metadata();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -1026,6 +1060,23 @@ impl AeroFlywayApp {
                             }
                         });
 
+                        ui.add_space(4.0);
+                        ui.small(
+                            RichText::new(format!(
+                                "Active Campaign: '{}' ({}) | Region: {} | DOY {:.0} | {} | Lights-Out {:.0}% | {} obs | Updated: {}",
+                                self.active_campaign.campaign_name,
+                                self.active_campaign.db_path,
+                                self.active_campaign.region_code,
+                                self.active_campaign.doy,
+                                self.active_campaign.cmip6_code,
+                                self.active_campaign.lights_out_pct,
+                                self.active_campaign.observation_count,
+                                self.active_campaign.updated_at,
+                            ))
+                            .monospace()
+                            .color(Color32::from_rgb(148, 163, 184)),
+                        );
+
                         ui.add_space(6.0);
                         ui.label(RichText::new("Quick Campaign Templates:").strong());
                         for (db_f, title, reg) in [
@@ -1089,7 +1140,7 @@ impl AeroFlywayApp {
                             };
                             egui::Frame::NONE
                                 .fill(Color32::from_rgb(17, 26, 41))
-                                .stroke(Stroke::new(1.2, border_c))
+                                .stroke(Stroke::new(1.2_f32, border_c))
                                 .corner_radius(CornerRadius::same(6))
                                 .inner_margin(8.0)
                                 .show(ui, |ui| {
@@ -1179,6 +1230,8 @@ impl AeroFlywayApp {
                 ui.monospace("  H     : Toggle Startup Campaign Hub <-> 3D GIS Map");
                 ui.monospace("  R     : Jump to NEXRAD / Aloft Vertical Radar Profile (VPTS) tab");
                 ui.monospace("  L     : Toggle 85% BirdCast Lights-Out curfew vs 0% unmitigated");
+                ui.monospace("  Ctrl+S: Save active campaign metadata to SQLite");
+                ui.monospace("  Esc   : Dismiss About/Help modal or reset map tool to Pan & Inspect");
                 ui.monospace("  F1    : Show / hide this reference window");
                 ui.separator();
                 ui.label(RichText::new("Empirical Data & Model Grounding").strong());
@@ -1584,7 +1637,8 @@ impl AeroFlywayApp {
                     ui.add(
                         egui::Slider::new(&mut self.params.lights_out_curfew_pct, 0.0..=100.0)
                             .suffix("% dimmed"),
-                    );
+                    )
+                    .on_hover_text("Fraction of urban building window lighting extinguished during nocturnal migration hours (23:00-06:00)");
                     ui.horizontal(|ui| {
                         if ui.button("Unmitigated (0%)").clicked() {
                             self.params.lights_out_curfew_pct = 0.0;
@@ -1600,12 +1654,14 @@ impl AeroFlywayApp {
                     ui.add(
                         egui::Slider::new(&mut self.params.skyglow_intensity_mult, 0.0..=2.5)
                             .suffix("x"),
-                    );
+                    )
+                    .on_hover_text("Scalar multiplier on EOG VIIRS DNB upward urban skyglow radiance (nW/cm^2/sr) driving phototactic attraction");
                     ui.label("NEXRAD / Aloft VPTS Altitude Assimilation");
                     ui.add(
                         egui::Slider::new(&mut self.params.radar_nudge_weight, 0.0..=1.0)
                             .fixed_decimals(2),
-                    );
+                    )
+                    .on_hover_text("EnKF nudging gain coupling agent flight altitude distributions toward observed NEXRAD / Aloft VPTS vertical density profiles");
 
                     ui.add_space(6.0);
                     ui.separator();
@@ -1673,6 +1729,7 @@ impl AeroFlywayApp {
                             egui::Slider::new(&mut self.params.smoke_pm25_offset_ugm3, 0.0..=280.0)
                                 .suffix(" ug/m3"),
                         )
+                        .on_hover_text("Wildfire smoke PM2.5 concentration offset; triggers behavioral ceiling climb and avoidance above 160 ug/m^3")
                         .changed()
                     {
                         self.engine.radar_profiles = build_regional_radar_profiles(
@@ -1687,19 +1744,22 @@ impl AeroFlywayApp {
                     ui.add(
                         egui::Slider::new(&mut self.params.turbine_cut_in_mps, 3.0..=7.5)
                             .suffix(" m/s"),
-                    );
+                    )
+                    .on_hover_text("Minimum hub-height wind speed before wind turbine blades begin spinning; higher cut-in speeds reduce nocturnal bat rotor mortality");
 
                     ui.label("850 hPa Low-Level Jet Multiplier");
                     ui.add(
                         egui::Slider::new(&mut self.params.wind_850_multiplier, 0.2..=2.5)
                             .suffix("x"),
-                    );
+                    )
+                    .on_hover_text("Scaling factor on synoptic 850 hPa tailwind / headwind jet speeds governing groundspeed and energetic drift");
 
                     ui.label("Precipitation Fallout Front (mm/hr)");
                     ui.add(
                         egui::Slider::new(&mut self.params.precip_front_mm_hr, 0.0..=5.0)
                             .suffix(" mm/h"),
-                    );
+                    )
+                    .on_hover_text("Frontal rainfall intensity forcing nocturnal migration ceiling suppression and coastal/stopover fallout");
 
                     ui.add_space(6.0);
                     ui.separator();
@@ -1803,7 +1863,7 @@ impl AeroFlywayApp {
         painter.rect_stroke(
             plot_rect,
             CornerRadius::same(4),
-            Stroke::new(1.0, Color32::from_rgb(38, 52, 73)),
+            Stroke::new(1.0_f32, Color32::from_rgb(38, 52, 73)),
             StrokeKind::Inside,
         );
 
@@ -1843,7 +1903,7 @@ impl AeroFlywayApp {
             let y_rad = map_xz(0.0, self.engine.metrics.radar_peak_alt_m).y;
             painter.line_segment(
                 [Pos2::new(inner.left(), y_rad), Pos2::new(inner.right(), y_rad)],
-                Stroke::new(1.1, Color32::from_rgba_unmultiplied(34, 211, 238, 150)),
+                Stroke::new(1.1_f32, Color32::from_rgba_unmultiplied(34, 211, 238, 150)),
             );
         }
 
@@ -1851,7 +1911,7 @@ impl AeroFlywayApp {
             let y = map_xz(0.0, elev).y;
             painter.line_segment(
                 [Pos2::new(inner.left(), y), Pos2::new(inner.right(), y)],
-                Stroke::new(0.8, Color32::from_rgba_unmultiplied(71, 85, 105, 90)),
+                Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(71, 85, 105, 90)),
             );
             painter.text(
                 Pos2::new(inner.left() - 6.0, y),
@@ -1869,7 +1929,7 @@ impl AeroFlywayApp {
                 .collect();
             painter.add(egui::Shape::line(
                 rotor_pts,
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(244, 63, 94, 120)),
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(244, 63, 94, 120)),
             ));
         }
 
@@ -1879,13 +1939,13 @@ impl AeroFlywayApp {
             let bot_p = Pos2::new(top_p.x, inner.bottom());
             painter.line_segment(
                 [bot_p, top_p],
-                Stroke::new(3.0, Color32::from_rgba_unmultiplied(30, 58, 47, 155)),
+                Stroke::new(3.0_f32, Color32::from_rgba_unmultiplied(30, 58, 47, 155)),
             );
             terr_poly.push(top_p);
         }
         painter.add(egui::Shape::line(
             terr_poly,
-            Stroke::new(1.8, Color32::from_rgb(74, 222, 128)),
+            Stroke::new(1.8_f32, Color32::from_rgb(74, 222, 128)),
         ));
 
         if self.gpu_mode_active() {
@@ -2012,7 +2072,7 @@ impl AeroFlywayApp {
         painter.rect_stroke(
             outer,
             CornerRadius::same(4),
-            Stroke::new(1.0, Color32::from_rgb(38, 52, 73)),
+            Stroke::new(1.0_f32, Color32::from_rgb(38, 52, 73)),
             StrokeKind::Inside,
         );
 
@@ -2037,7 +2097,7 @@ impl AeroFlywayApp {
             let y = inner.bottom() - fy * inner.height();
             painter.line_segment(
                 [Pos2::new(inner.left(), y), Pos2::new(inner.right(), y)],
-                Stroke::new(0.7, Color32::from_rgba_unmultiplied(51, 65, 85, 110)),
+                Stroke::new(0.7_f32, Color32::from_rgba_unmultiplied(51, 65, 85, 110)),
             );
             painter.text(
                 Pos2::new(inner.left() - 6.0, y),
@@ -2071,7 +2131,7 @@ impl AeroFlywayApp {
             painter.arrow(
                 barb_origin,
                 vec_px,
-                Stroke::new(1.2, Color32::from_rgba_unmultiplied(167, 243, 208, 195)),
+                Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(167, 243, 208, 195)),
             );
         }
 
@@ -2291,7 +2351,7 @@ impl AeroFlywayApp {
             painter.rect_stroke(
                 outer,
                 CornerRadius::same(4),
-                Stroke::new(1.0, Color32::from_rgb(45, 58, 82)),
+                Stroke::new(1.0_f32, Color32::from_rgb(45, 58, 82)),
                 StrokeKind::Inside,
             );
 
@@ -2324,7 +2384,7 @@ impl AeroFlywayApp {
                     let khz = (frac as f64) * top_khz;
                     painter.line_segment(
                         [Pos2::new(inner.left() - 4.0, y), Pos2::new(inner.left(), y)],
-                        Stroke::new(1.0, Color32::from_rgb(100, 116, 139)),
+                        Stroke::new(1.0_f32, Color32::from_rgb(100, 116, 139)),
                     );
                     painter.text(
                         Pos2::new(inner.left() - 6.0, y),
@@ -2342,7 +2402,7 @@ impl AeroFlywayApp {
                     let t_ms = (frac as f64) * dur_ms;
                     painter.line_segment(
                         [Pos2::new(x, inner.bottom()), Pos2::new(x, inner.bottom() + 4.0)],
-                        Stroke::new(1.0, Color32::from_rgb(100, 116, 139)),
+                        Stroke::new(1.0_f32, Color32::from_rgb(100, 116, 139)),
                     );
                     let align = match step {
                         0 => Align2::LEFT_TOP,
@@ -2379,7 +2439,7 @@ impl AeroFlywayApp {
                 painter.rect_stroke(
                     cbar_rect,
                     CornerRadius::same(1),
-                    Stroke::new(1.0, Color32::from_rgb(71, 85, 105)),
+                    Stroke::new(1.0_f32, Color32::from_rgb(71, 85, 105)),
                     StrokeKind::Inside,
                 );
                 let db_mid = 0.5 * (SPECTROGRAM_DB_CEIL + self.acoustics.db_floor);
@@ -2443,7 +2503,7 @@ impl AeroFlywayApp {
                         painter.rect_stroke(
                             p_rect.expand(3.0),
                             CornerRadius::same(2),
-                            Stroke::new(1.8, Color32::from_rgb(250, 204, 21)),
+                            Stroke::new(1.8_f32, Color32::from_rgb(250, 204, 21)),
                             StrokeKind::Outside,
                         );
                         painter.text(
@@ -2457,7 +2517,7 @@ impl AeroFlywayApp {
                         painter.rect_stroke(
                             p_rect,
                             CornerRadius::same(1),
-                            Stroke::new(0.8, Color32::from_rgba_unmultiplied(148, 163, 184, 75)),
+                            Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(148, 163, 184, 75)),
                             StrokeKind::Outside,
                         );
                     }
@@ -2572,6 +2632,15 @@ impl AeroFlywayApp {
 
             ui.label("Smoke:");
             ui.add(egui::TextEdit::singleline(&mut self.batch_ui.smoke_csv).desired_width(68.0));
+
+            ui.label("Hours:");
+            ui.add(
+                egui::DragValue::new(&mut self.batch_ui.sweep_hours)
+                    .range(6.0..=240.0)
+                    .speed(1.0)
+                    .suffix(" h"),
+            )
+            .on_hover_text("Simulation duration per sweep scenario (6.0–240.0 h)");
 
             if ui.button("Output Folder...").clicked() {
                 if let Some(dir) = rfd::FileDialog::new()
@@ -2852,7 +2921,7 @@ impl AeroFlywayApp {
                         rad,
                         Color32::from_rgba_unmultiplied(16, 185, 129, 65),
                     );
-                    painter.circle_stroke(sp, rad, Stroke::new(1.3, Color32::from_rgb(52, 211, 153)));
+                    painter.circle_stroke(sp, rad, Stroke::new(1.3_f32, Color32::from_rgb(52, 211, 153)));
                 }
             }
 
@@ -2865,7 +2934,7 @@ impl AeroFlywayApp {
                     painter.circle_stroke(
                         sp,
                         5.5,
-                        Stroke::new(1.2, Color32::from_rgba_unmultiplied(244, 63, 94, 195)),
+                        Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(244, 63, 94, 195)),
                     );
                     painter.circle_filled(sp, 2.0, Color32::from_rgb(251, 113, 133));
                 }
@@ -2884,14 +2953,14 @@ impl AeroFlywayApp {
                         painter.circle_stroke(
                             sp,
                             7.5,
-                            Stroke::new(1.6, Color32::from_rgb(254, 240, 138)),
+                            Stroke::new(1.6_f32, Color32::from_rgb(254, 240, 138)),
                         );
                     }
                     let r_rect = Rect::from_center_size(sp, Vec2::splat(5.5));
                     painter.rect_stroke(
                         r_rect,
                         CornerRadius::same(1),
-                        Stroke::new(1.2, col),
+                        Stroke::new(1.2_f32, col),
                         StrokeKind::Inside,
                     );
                 }
@@ -3031,7 +3100,7 @@ impl AeroFlywayApp {
                 self.params.transect_end.1,
                 canvas_rect,
             );
-            painter.line_segment([pa, pb], Stroke::new(2.0, Color32::from_rgb(52, 211, 153)));
+            painter.line_segment([pa, pb], Stroke::new(2.0_f32, Color32::from_rgb(52, 211, 153)));
             painter.circle_filled(pa, 5.0, Color32::from_rgb(16, 185, 129));
             painter.circle_filled(pb, 5.0, Color32::from_rgb(16, 185, 129));
             painter.text(
@@ -3097,7 +3166,7 @@ impl AeroFlywayApp {
             painter.circle_stroke(
                 sp,
                 px_r,
-                Stroke::new(1.1, Color32::from_rgba_unmultiplied(251, 191, 36, 130)),
+                Stroke::new(1.1_f32, Color32::from_rgba_unmultiplied(251, 191, 36, 130)),
             );
             if self.map.zoom >= 5.2 && canvas_rect.contains(sp) {
                 label_candidates.push(MapLabelCandidate {
@@ -3128,7 +3197,7 @@ impl AeroFlywayApp {
             painter.circle_stroke(
                 sp,
                 ring_px,
-                Stroke::new(1.1, Color32::from_rgba_unmultiplied(34, 211, 238, 125)),
+                Stroke::new(1.1_f32, Color32::from_rgba_unmultiplied(34, 211, 238, 125)),
             );
             painter.circle_filled(sp, 3.8, Color32::from_rgb(34, 211, 238));
             if canvas_rect.contains(sp) {
@@ -3145,7 +3214,7 @@ impl AeroFlywayApp {
     }
 
     fn paint_vector_basemap(&self, painter: &egui::Painter, canvas_rect: Rect) {
-        let graticule_stroke = Stroke::new(0.6, Color32::from_rgba_unmultiplied(51, 65, 85, 95));
+        let graticule_stroke = Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(51, 65, 85, 95));
         let (min_lat_b, max_lat_b, min_lon_b, max_lon_b) = self.params.region.corridor_bounds();
         let lat_lo = ((min_lat_b - 18.0).max(-64.0) / 4.0).floor() as i32 * 4;
         let lat_hi = ((max_lat_b + 18.0).min(76.0) / 4.0).ceil() as i32 * 4;
@@ -3179,11 +3248,11 @@ impl AeroFlywayApp {
         for border in basemap.borders {
             draw_poly(
                 border,
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(100, 116, 139, 135)),
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(100, 116, 139, 135)),
             );
         }
         for (idx, coastline) in basemap.coastlines.iter().enumerate() {
-            let width = if idx == 0 { 2.0 } else { 1.5 };
+            let width = if idx == 0 { 2.0 } else { 1.5_f32 };
             let alpha = if idx == 0 { 220 } else { 185 };
             draw_poly(
                 coastline,
@@ -3196,7 +3265,7 @@ impl AeroFlywayApp {
             } else if idx == 1 {
                 (1.6, Color32::from_rgba_unmultiplied(56, 189, 248, 175))
             } else {
-                (1.2, Color32::from_rgba_unmultiplied(56, 189, 248, 125))
+                (1.2_f32, Color32::from_rgba_unmultiplied(56, 189, 248, 125))
             };
             draw_poly(river, Stroke::new(width, col));
         }
@@ -3230,7 +3299,7 @@ impl AeroFlywayApp {
             painter.add(egui::Shape::convex_polygon(
                 verts,
                 Color32::from_rgba_unmultiplied(56, 189, 248, alpha),
-                Stroke::new(0.7, Color32::from_rgba_unmultiplied(56, 189, 248, 65)),
+                Stroke::new(0.7_f32, Color32::from_rgba_unmultiplied(56, 189, 248, 65)),
             ));
         }
     }
@@ -3247,7 +3316,7 @@ impl AeroFlywayApp {
             painter.arrow(
                 origin,
                 vec_px,
-                Stroke::new(1.5, Color32::from_rgba_unmultiplied(148, 163, 184, 190)),
+                Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(148, 163, 184, 190)),
             );
         }
     }
@@ -3269,7 +3338,7 @@ impl AeroFlywayApp {
                 LandmarkKind::MonarchSanctuary => (Color32::from_rgb(251, 191, 36), "ROOST", 2),
                 LandmarkKind::CascadePeak => (Color32::from_rgb(203, 213, 225), "PEAK", 3),
             };
-            painter.circle_stroke(sp, 4.5, Stroke::new(1.4, col));
+            painter.circle_stroke(sp, 4.5, Stroke::new(1.4_f32, col));
             if self.map.zoom >= 5.2 {
                 label_candidates.push(MapLabelCandidate {
                     anchor: sp,
@@ -3318,7 +3387,7 @@ impl AeroFlywayApp {
                     painter.line_segment(
                         [cand.anchor, edge_pt],
                         Stroke::new(
-                            0.8,
+                            0.8_f32,
                             Color32::from_rgba_unmultiplied(
                                 cand.color.r(),
                                 cand.color.g(),
@@ -3337,7 +3406,7 @@ impl AeroFlywayApp {
                     pill_rect,
                     CornerRadius::same(4),
                     Stroke::new(
-                        0.8,
+                        0.8_f32,
                         Color32::from_rgba_unmultiplied(
                             cand.color.r(),
                             cand.color.g(),
@@ -3369,7 +3438,7 @@ impl AeroFlywayApp {
                     painter.rect_stroke(
                         pill_rect,
                         CornerRadius::same(4),
-                        Stroke::new(1.0, color),
+                        Stroke::new(1.0_f32, color),
                         StrokeKind::Inside,
                     );
                     painter.galley(pill_rect.min + Vec2::new(5.0, 2.0), galley, color);
@@ -3409,7 +3478,7 @@ impl AeroFlywayApp {
         painter.rect_stroke(
             hud_rect,
             CornerRadius::same(6),
-            Stroke::new(1.0, Color32::from_rgb(51, 65, 85)),
+            Stroke::new(1.0_f32, Color32::from_rgb(51, 65, 85)),
             StrokeKind::Inside,
         );
 
@@ -3417,7 +3486,7 @@ impl AeroFlywayApp {
         let bar_x0 = hud_rect.left() + 12.0;
         painter.line_segment(
             [Pos2::new(bar_x0, bar_y), Pos2::new(bar_x0 + bar_px, bar_y)],
-            Stroke::new(2.2, Color32::from_rgb(226, 232, 240)),
+            Stroke::new(2.2_f32, Color32::from_rgb(226, 232, 240)),
         );
         painter.text(
             Pos2::new(bar_x0 + bar_px + 8.0, bar_y),
@@ -4042,4 +4111,136 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| Ok(Box::new(AeroFlywayApp::new(cc, skip_hub)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("aeroflyway_gui_test_{tag}_{}.db", std::process::id()))
+    }
+
+    fn cleanup_db(path: &PathBuf) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn step_app_with_input(
+        app: &mut AeroFlywayApp,
+        ctx: &egui::Context,
+        modifiers: egui::Modifiers,
+        events: Vec<egui::Event>,
+        dropped_files: Vec<egui::DroppedFile>,
+    ) {
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(1280.0, 800.0),
+            )),
+            modifiers,
+            events,
+            dropped_files,
+            ..Default::default()
+        };
+        let _ = ctx.run(raw_input, |c| {
+            app.render_ui(c);
+        });
+    }
+
+    #[test]
+    fn dropped_invalid_csv_reports_vpts_error_without_wav_fallthrough() {
+        let db_path = temp_db("csv_drop");
+        cleanup_db(&db_path);
+        let bad_csv = std::env::temp_dir().join(format!(
+            "aeroflyway_bad_vpts_{}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&bad_csv, "not,a,valid,vpts,header\n1,2,3,4,5\n").expect("write temp csv");
+
+        let ctx = egui::Context::default();
+        let mut app = AeroFlywayApp::new_with_wgpu(&ctx, None, db_path.clone(), true);
+        app.running = false;
+
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            Vec::new(),
+            vec![egui::DroppedFile {
+                path: Some(bad_csv.clone()),
+                ..Default::default()
+            }],
+        );
+
+        assert!(
+            app.status_line.starts_with("VPTS CSV load error:"),
+            "expected VPTS CSV error, got: {}",
+            app.status_line
+        );
+        assert!(!app.status_line.contains("WAV"));
+
+        let _ = std::fs::remove_file(&bad_csv);
+        drop(app);
+        cleanup_db(&db_path);
+    }
+
+    #[test]
+    fn headless_escape_layering_and_ctrl_s_save_campaign() {
+        let db_path = temp_db("shortcuts");
+        cleanup_db(&db_path);
+
+        let ctx = egui::Context::default();
+        let mut app = AeroFlywayApp::new_with_wgpu(&ctx, None, db_path.clone(), true);
+        app.running = false;
+        app.show_about_modal = true;
+        app.show_help_modal = true;
+        app.tool_mode = MapToolMode::DrawTransect;
+        app.campaign_name_input = "Shortcut Persisted Campaign".to_string();
+
+        let esc = || egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        // 1st Escape dismisses About modal first
+        step_app_with_input(&mut app, &ctx, egui::Modifiers::NONE, vec![esc()], Vec::new());
+        assert!(!app.show_about_modal);
+        assert!(app.show_help_modal);
+        assert_eq!(app.tool_mode, MapToolMode::DrawTransect);
+
+        // 2nd Escape dismisses Help modal next
+        step_app_with_input(&mut app, &ctx, egui::Modifiers::NONE, vec![esc()], Vec::new());
+        assert!(!app.show_help_modal);
+        assert_eq!(app.tool_mode, MapToolMode::DrawTransect);
+
+        // 3rd Escape resets map tool to PanAndInspect
+        step_app_with_input(&mut app, &ctx, egui::Modifiers::NONE, vec![esc()], Vec::new());
+        assert_eq!(app.tool_mode, MapToolMode::PanAndInspect);
+
+        // Ctrl+S saves campaign metadata and refreshes active_campaign + status_line
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::CTRL,
+            vec![egui::Event::Key {
+                key: egui::Key::S,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            Vec::new(),
+        );
+        assert_eq!(app.active_campaign.campaign_name, "Shortcut Persisted Campaign");
+        assert!(app.status_line.contains("Saved campaign 'Shortcut Persisted Campaign'"));
+        assert_ne!(app.active_campaign.updated_at, "2026-11-14T04:10Z");
+
+        drop(app);
+        cleanup_db(&db_path);
+    }
 }
