@@ -83,6 +83,37 @@ enum BottomDockTab {
     BatchSweepLab,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScenarioPreset {
+    AutumnLightsOutPeak,
+    MegafireSmokeSsp585,
+    SpringFalloutUnmitigated,
+}
+
+impl ScenarioPreset {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AutumnLightsOutPeak => "Autumn Lights-Out",
+            Self::MegafireSmokeSsp585 => "Megafire SSP5-8.5",
+            Self::SpringFalloutUnmitigated => "Spring Fallout",
+        }
+    }
+
+    fn hover_description(self) -> &'static str {
+        match self {
+            Self::AutumnLightsOutPeak => {
+                "DOY 272 peak autumn flight with 85% BirdCast Lights-Out curfew, 5.5 m/s smart bat curtailment, and 1.15x 850 hPa tailwind."
+            }
+            Self::MegafireSmokeSsp585 => {
+                "DOY 258 CMIP6 SSP5-8.5 (+4.1 C) with 195 ug/m^3 wildfire smoke plume forcing >1,850 m AGL climbs and trophic mismatch."
+            }
+            Self::SpringFalloutUnmitigated => {
+                "DOY 128 spring northbound push under SSP2-4.5 with 2.6 mm/hr frontal rain fallout, 0% Lights-Out, and 1.6x skyglow."
+            }
+        }
+    }
+}
+
 struct LayerToggles {
     birds: bool,
     bats: bool,
@@ -256,6 +287,8 @@ struct AeroFlywayApp {
 
     bottom_tab: BottomDockTab,
     bottom_dock_default_height: f32,
+    last_transect_size_pts: (f32, f32),
+    active_scenario_preset: Option<ScenarioPreset>,
     acoustics: AcousticInspectorState,
     batch_ui: BatchSweepUiState,
     export_dir_input: String,
@@ -366,6 +399,8 @@ impl AeroFlywayApp {
             gpu_cum_urban_baseline: 0,
             bottom_tab: BottomDockTab::AirspaceTransect,
             bottom_dock_default_height: 255.0,
+            last_transect_size_pts: (840.0, 180.0),
+            active_scenario_preset: None,
             acoustics: AcousticInspectorState::new_with_default_preset(),
             batch_ui: BatchSweepUiState::new(),
             export_dir_input: "exports".to_string(),
@@ -504,6 +539,94 @@ impl AeroFlywayApp {
         }
     }
 
+    fn reset_camera(&mut self) {
+        let (clat, clon, zoom) = self.params.region.default_viewport();
+        self.map.jump_to(clat, clon, zoom);
+        self.map.pitch_deg = 42.0;
+        self.map.bearing_deg = -18.0;
+        self.map.alt_exaggeration = 1.0;
+        self.status_line = format!(
+            "Reset camera to {} default ({clat:.2}, {clon:.2}, z={zoom:.1}, 2.5D)",
+            self.params.region.code()
+        );
+    }
+
+    fn toggle_lights_out_curfew(&mut self) {
+        let enable = self.params.lights_out_curfew_pct < 70.0;
+        self.params.lights_out_curfew_pct = if enable { 85.0 } else { 0.0 };
+        let est_reduction =
+            compute_lights_out_collision_reduction_pct(self.params.lights_out_curfew_pct);
+        self.status_line = if enable {
+            format!(
+                "Lights-Out curfew ON: 85% dimmed (23:00-06:00, ~{est_reduction:.0}% strike reduction)"
+            )
+        } else {
+            "Lights-Out curfew OFF: 0% dimmed (unmitigated urban skyglow)".to_string()
+        };
+    }
+
+    fn apply_scenario_preset(&mut self, preset: ScenarioPreset) {
+        match preset {
+            ScenarioPreset::AutumnLightsOutPeak => {
+                self.params.season = SeasonPreset::AutumnFalloutAndBatPulse;
+                self.params.day_of_year = 272.0;
+                self.params.cmip6_scenario = Cmip6Scenario::BaselineHistorical;
+                self.params.lights_out_curfew_pct = 85.0;
+                self.params.skyglow_intensity_mult = 1.0;
+                self.params.turbine_cut_in_mps = 5.5;
+                self.params.smoke_pm25_offset_ugm3 = 0.0;
+                self.params.precip_front_mm_hr = 0.4;
+                self.params.wind_850_multiplier = 1.15;
+                self.params.radar_nudge_weight = 0.65;
+            }
+            ScenarioPreset::MegafireSmokeSsp585 => {
+                self.params.season = SeasonPreset::AutumnFalloutAndBatPulse;
+                self.params.day_of_year = 258.0;
+                self.params.cmip6_scenario = Cmip6Scenario::Ssp585High;
+                self.params.lights_out_curfew_pct = 35.0;
+                self.params.skyglow_intensity_mult = 1.0;
+                self.params.turbine_cut_in_mps = 3.5;
+                self.params.smoke_pm25_offset_ugm3 = 195.0;
+                self.params.precip_front_mm_hr = 0.0;
+                self.params.wind_850_multiplier = 1.0;
+                self.params.radar_nudge_weight = 0.65;
+            }
+            ScenarioPreset::SpringFalloutUnmitigated => {
+                self.params.season = SeasonPreset::SpringNorthbound;
+                self.params.day_of_year = 128.0;
+                self.params.cmip6_scenario = Cmip6Scenario::Ssp245Intermediate;
+                self.params.lights_out_curfew_pct = 0.0;
+                self.params.skyglow_intensity_mult = 1.6;
+                self.params.turbine_cut_in_mps = 3.0;
+                self.params.smoke_pm25_offset_ugm3 = 0.0;
+                self.params.precip_front_mm_hr = 2.6;
+                self.params.wind_850_multiplier = 1.45;
+                self.params.radar_nudge_weight = 0.65;
+            }
+        }
+        self.engine.weather_nodes =
+            default_synoptic_nodes_for_region(self.params.region, self.params.cmip6_scenario);
+        self.engine.radar_profiles = build_regional_radar_profiles(
+            None,
+            self.params.region,
+            &self.engine.weather_nodes,
+            self.params.smoke_pm25_offset_ugm3,
+        );
+        self.engine
+            .reseed_agents(self.params.region, self.params.season);
+        self.reset_all_counters();
+        self.gpu_tick_seed = self.gpu_tick_seed.wrapping_add(1);
+        self.active_scenario_preset = Some(preset);
+        self.status_line = format!(
+            "Applied scenario '{}': DOY {:.0}, {}, Lights-Out {:.0}%, Smoke +{:.0} ug/m3",
+            preset.label(),
+            self.params.day_of_year,
+            self.params.cmip6_scenario.code().to_uppercase(),
+            self.params.lights_out_curfew_pct,
+            self.params.smoke_pm25_offset_ugm3
+        );
+    }
+
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
         let wants_kb = ctx.wants_keyboard_input();
         let (esc_pressed, save_pressed) = ctx.input(|i| {
@@ -528,31 +651,108 @@ impl AeroFlywayApp {
         if wants_kb {
             return;
         }
-        ctx.input(|i| {
-            if i.key_pressed(egui::Key::Space) {
-                self.running = !self.running;
+        let (
+            space_pressed,
+            f1_pressed,
+            h_pressed,
+            cam_reset_pressed,
+            tab_1,
+            tab_2,
+            tab_3,
+            tab_4,
+            t_pressed,
+            m_pressed,
+            l_pressed,
+        ) = ctx.input(|i| {
+            let no_mod = !i.modifiers.ctrl && !i.modifiers.command && !i.modifiers.alt;
+            if !no_mod {
+                return (
+                    false, false, false, false, false, false, false, false, false, false, false,
+                );
             }
-            if i.key_pressed(egui::Key::F1) {
-                self.show_help_modal = !self.show_help_modal;
-            }
-            if i.key_pressed(egui::Key::H) {
-                self.stage = match self.stage {
-                    AppStage::StartupHub => AppStage::Workbench,
-                    AppStage::Workbench => AppStage::StartupHub,
-                };
-            }
-            if i.key_pressed(egui::Key::R) {
-                self.stage = AppStage::Workbench;
-                self.bottom_tab = BottomDockTab::RadarVerticalProfile;
-            }
-            if i.key_pressed(egui::Key::L) {
-                self.params.lights_out_curfew_pct = if self.params.lights_out_curfew_pct < 70.0 {
-                    85.0
-                } else {
-                    0.0
-                };
-            }
+            (
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::F1),
+                i.key_pressed(egui::Key::H),
+                i.key_pressed(egui::Key::Num0) || i.key_pressed(egui::Key::R),
+                i.key_pressed(egui::Key::Num1),
+                i.key_pressed(egui::Key::Num2),
+                i.key_pressed(egui::Key::Num3),
+                i.key_pressed(egui::Key::Num4),
+                i.key_pressed(egui::Key::T),
+                i.key_pressed(egui::Key::M),
+                i.key_pressed(egui::Key::L),
+            )
         });
+
+        if space_pressed {
+            self.running = !self.running;
+            self.status_line = if self.running {
+                "Simulation resumed.".to_string()
+            } else {
+                "Simulation paused.".to_string()
+            };
+        }
+        if f1_pressed {
+            self.show_help_modal = !self.show_help_modal;
+        }
+        if h_pressed {
+            self.stage = match self.stage {
+                AppStage::StartupHub => AppStage::Workbench,
+                AppStage::Workbench => AppStage::StartupHub,
+            };
+        }
+        if cam_reset_pressed {
+            self.reset_camera();
+        }
+        if tab_1 {
+            self.stage = AppStage::Workbench;
+            self.bottom_tab = BottomDockTab::AirspaceTransect;
+            self.status_line = "Tab [1]: Airspace Cross-Section (0-4,200 m ASL)".to_string();
+        } else if tab_2 {
+            self.stage = AppStage::Workbench;
+            self.bottom_tab = BottomDockTab::RadarVerticalProfile;
+            self.status_line = "Tab [2]: NEXRAD / Aloft Vertical Profile (VPTS)".to_string();
+        } else if tab_3 {
+            self.stage = AppStage::Workbench;
+            self.bottom_tab = BottomDockTab::AcousticSpectrogram;
+            self.status_line = "Tab [3]: WAV STFT Bioacoustic Inspector".to_string();
+        } else if tab_4 {
+            self.stage = AppStage::Workbench;
+            self.bottom_tab = BottomDockTab::BatchSweepLab;
+            self.status_line = "Tab [4]: Multi-Scenario Batch Sweep Lab".to_string();
+        }
+        if t_pressed {
+            self.tool_mode = if self.tool_mode == MapToolMode::DrawTransect {
+                MapToolMode::PanAndInspect
+            } else {
+                MapToolMode::DrawTransect
+            };
+            self.transect_drag_anchor = None;
+            self.status_line = match self.tool_mode {
+                MapToolMode::DrawTransect => {
+                    "Tool mode: Draw A-B Transect (primary-drag on map)".to_string()
+                }
+                _ => "Tool mode: Pan & Inspect".to_string(),
+            };
+        }
+        if m_pressed {
+            self.tool_mode = if self.tool_mode == MapToolMode::PlantVirtualMilkweed {
+                MapToolMode::PanAndInspect
+            } else {
+                MapToolMode::PlantVirtualMilkweed
+            };
+            self.transect_drag_anchor = None;
+            self.status_line = match self.tool_mode {
+                MapToolMode::PlantVirtualMilkweed => {
+                    "Tool mode: Plant Virtual Milkweed Host Patch (click map)".to_string()
+                }
+                _ => "Tool mode: Pan & Inspect".to_string(),
+            };
+        }
+        if l_pressed {
+            self.toggle_lights_out_curfew();
+        }
     }
 
     fn handle_dropped_wav_files(&mut self, ctx: &egui::Context) {
@@ -902,12 +1102,12 @@ impl AeroFlywayApp {
                         self.trigger_live_sync(ctx);
                         ui.close_menu();
                     }
-                    if ui.button("Apply BirdCast 85% Lights-Out Curfew (L)").clicked() {
-                        self.params.lights_out_curfew_pct = 85.0;
+                    if ui.button("Toggle BirdCast 85% Lights-Out Curfew (L)").clicked() {
+                        self.toggle_lights_out_curfew();
                         ui.close_menu();
                     }
-                    if ui.button("Unmitigated Urban Skyglow (0% Curfew)").clicked() {
-                        self.params.lights_out_curfew_pct = 0.0;
+                    if ui.button("Reset Camera to Corridor 2.5D Default (0 / R)").clicked() {
+                        self.reset_camera();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -919,6 +1119,7 @@ impl AeroFlywayApp {
                             &self.engine.weather_nodes,
                             195.0,
                         );
+                        self.status_line = "Applied +195 ug/m3 wildfire smoke plume offset.".to_string();
                         ui.close_menu();
                     }
                     if ui.button("Clear Wildfire Smoke Offset").clicked() {
@@ -929,10 +1130,11 @@ impl AeroFlywayApp {
                             &self.engine.weather_nodes,
                             0.0,
                         );
+                        self.status_line = "Cleared wildfire smoke PM2.5 offset.".to_string();
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Open Radar Vertical Profile Tab (R)").clicked() {
+                    if ui.button("Open Radar Vertical Profile Tab (2)").clicked() {
                         self.stage = AppStage::Workbench;
                         self.bottom_tab = BottomDockTab::RadarVerticalProfile;
                         ui.close_menu();
@@ -1097,12 +1299,14 @@ impl AeroFlywayApp {
                             egui::Slider::new(&mut self.params.day_of_year, 1.0..=365.0)
                                 .prefix("Day of Year (DOY): ")
                                 .fixed_decimals(0),
-                        );
+                        )
+                        .on_hover_text("Continuous 365-day Day-of-Year controlling solar declination, photoperiod, and northbound/southbound corridor bearing.");
                         ui.add(
                             egui::Slider::new(&mut self.params.lights_out_curfew_pct, 0.0..=100.0)
                                 .text("Lights-Out Curfew (23:00-06:00)")
                                 .suffix("%"),
-                        );
+                        )
+                        .on_hover_text("Municipal BirdCast Lights-Out dimming percentage during 23:00-06:00 (0.88 curfew factor; 0.32 early-dusk factor).");
                         egui::ComboBox::from_id_salt("hub_cmip6_combo")
                             .selected_text(self.params.cmip6_scenario.label())
                             .show_ui(ui, |ui| {
@@ -1228,7 +1432,9 @@ impl AeroFlywayApp {
                 ui.label(RichText::new("Keyboard Shortcuts").strong());
                 ui.monospace("  Space : Play / Pause multi-taxa simulation");
                 ui.monospace("  H     : Toggle Startup Campaign Hub <-> 3D GIS Map");
-                ui.monospace("  R     : Jump to NEXRAD / Aloft Vertical Radar Profile (VPTS) tab");
+                ui.monospace("  0 / R : Reset camera to active corridor default 2.5D view");
+                ui.monospace("  1 - 4 : Switch bottom dock tabs (1 Transect, 2 VPTS, 3 WAV, 4 Batch)");
+                ui.monospace("  T / M : Toggle Draw A-B Transect (T) or Plant Host Patch (M) tool");
                 ui.monospace("  L     : Toggle 85% BirdCast Lights-Out curfew vs 0% unmitigated");
                 ui.monospace("  Ctrl+S: Save active campaign metadata to SQLite");
                 ui.monospace("  Esc   : Dismiss About/Help modal or reset map tool to Pan & Inspect");
@@ -1373,13 +1579,30 @@ impl AeroFlywayApp {
                     });
 
                 ui.separator();
-                for (mode, txt) in [
-                    (MapToolMode::PanAndInspect, "Pan / Inspect"),
-                    (MapToolMode::DrawTransect, "Draw A-B Transect"),
-                    (MapToolMode::PlantVirtualMilkweed, "Plant Host Patch"),
+                for (mode, txt, tip) in [
+                    (
+                        MapToolMode::PanAndInspect,
+                        "Pan / Inspect",
+                        "Primary-drag to pan, secondary-drag to orbit/tilt 2.5D camera, scroll to zoom (Esc).",
+                    ),
+                    (
+                        MapToolMode::DrawTransect,
+                        "Draw A-B Transect (T)",
+                        "Primary-drag on map to reposition the A -> B vertical airspace cross-section (T).",
+                    ),
+                    (
+                        MapToolMode::PlantVirtualMilkweed,
+                        "Plant Host Patch (M)",
+                        "Click on map to insert a virtual Asclepias stepping-stone persisted in SQLite (M).",
+                    ),
                 ] {
-                    if ui.selectable_label(self.tool_mode == mode, txt).clicked() {
+                    if ui
+                        .selectable_label(self.tool_mode == mode, txt)
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
                         self.tool_mode = mode;
+                        self.transect_drag_anchor = None;
                     }
                 }
 
@@ -1407,6 +1630,7 @@ impl AeroFlywayApp {
 
     fn render_left_dock(&mut self, ctx: &egui::Context) {
         let mut jump_region: Option<FlywayRegion> = None;
+        let mut chosen_preset: Option<ScenarioPreset> = None;
 
         egui::SidePanel::left("left_analytics_dock")
             .resizable(true)
@@ -1595,7 +1819,8 @@ impl AeroFlywayApp {
                             egui::Slider::new(&mut self.gpu_agent_count, 512..=MAX_GPU_AGENTS)
                                 .step_by(256.0)
                                 .suffix(" agents"),
-                        );
+                        )
+                        .on_hover_text("Number of VRAM-resident multi-taxa agents simulated per tick by compute.wgsl and drawn via zero-copy instancing.");
                     }
 
                     ui.add_space(5.0);
@@ -1606,19 +1831,22 @@ impl AeroFlywayApp {
                             .prefix("Pitch ")
                             .suffix(" deg")
                             .fixed_decimals(0),
-                    );
+                    )
+                    .on_hover_text("Camera tilt angle (0 deg = 2D Plan, 42-62 deg = 2.5D perspective oblique with ground shadows and drop-lines).");
                     ui.add(
                         egui::Slider::new(&mut self.map.bearing_deg, -180.0..=180.0)
                             .prefix("Bearing ")
                             .suffix(" deg")
                             .fixed_decimals(0),
-                    );
+                    )
+                    .on_hover_text("Azimuthal map camera rotation around corridor center (degrees clockwise from North).");
                     ui.add(
                         egui::Slider::new(&mut self.map.alt_exaggeration, 0.0..=2.5)
                             .prefix("Alt Exag ")
                             .suffix("x")
                             .fixed_decimals(2),
-                    );
+                    )
+                    .on_hover_text("Vertical exaggeration applied to airborne altitude (m AGL) in 2.5D oblique projection.");
                     ui.horizontal(|ui| {
                         if ui.button("2.5D Oblique").clicked() {
                             self.map.pitch_deg = 42.0;
@@ -1627,6 +1855,33 @@ impl AeroFlywayApp {
                         if ui.button("2D Plan").clicked() {
                             self.map.pitch_deg = 0.0;
                             self.map.bearing_deg = 0.0;
+                        }
+                        if ui
+                            .button("Reset (0/R)")
+                            .on_hover_text("Reset camera to active corridor default viewport & 2.5D angle (hotkey: 0 or R).")
+                            .clicked()
+                        {
+                            self.reset_camera();
+                        }
+                    });
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.heading("Scenario Presets");
+                    ui.horizontal_wrapped(|ui| {
+                        for preset in [
+                            ScenarioPreset::AutumnLightsOutPeak,
+                            ScenarioPreset::MegafireSmokeSsp585,
+                            ScenarioPreset::SpringFalloutUnmitigated,
+                        ] {
+                            let is_active = self.active_scenario_preset == Some(preset);
+                            if ui
+                                .selectable_label(is_active, preset.label())
+                                .on_hover_text(preset.hover_description())
+                                .clicked()
+                            {
+                                chosen_preset = Some(preset);
+                            }
                         }
                     });
 
@@ -1638,16 +1893,19 @@ impl AeroFlywayApp {
                         egui::Slider::new(&mut self.params.lights_out_curfew_pct, 0.0..=100.0)
                             .suffix("% dimmed"),
                     )
-                    .on_hover_text("Fraction of urban building window lighting extinguished during nocturnal migration hours (23:00-06:00)");
+                    .on_hover_text("Fraction of urban building window lighting extinguished during nocturnal migration (23:00-06:00 curfew factor 0.88; early dusk shoulder 0.32).");
                     ui.horizontal(|ui| {
                         if ui.button("Unmitigated (0%)").clicked() {
                             self.params.lights_out_curfew_pct = 0.0;
+                            self.status_line = "Lights-Out curfew OFF: 0% dimmed.".to_string();
                         }
                         if ui.button("50% Window Dim").clicked() {
                             self.params.lights_out_curfew_pct = 50.0;
+                            self.status_line = "Lights-Out curfew: 50% window dimming applied.".to_string();
                         }
                         if ui.button("BirdCast Alert (85%)").clicked() {
                             self.params.lights_out_curfew_pct = 85.0;
+                            self.status_line = "Lights-Out curfew ON: 85% BirdCast alert applied.".to_string();
                         }
                     });
                     ui.label("VIIRS Anthropogenic Skyglow Multiplier");
@@ -1655,13 +1913,13 @@ impl AeroFlywayApp {
                         egui::Slider::new(&mut self.params.skyglow_intensity_mult, 0.0..=2.5)
                             .suffix("x"),
                     )
-                    .on_hover_text("Scalar multiplier on EOG VIIRS DNB upward urban skyglow radiance (nW/cm^2/sr) driving phototactic attraction");
+                    .on_hover_text("Scalar multiplier (0.0-2.5x) on EOG VIIRS DNB upward urban skyglow radiance (nW/cm^2/sr); amplifies nocturnal phototactic entrainment (<300 m AGL) and building-strike hazard (^1.68 exponent).");
                     ui.label("NEXRAD / Aloft VPTS Altitude Assimilation");
                     ui.add(
                         egui::Slider::new(&mut self.params.radar_nudge_weight, 0.0..=1.0)
                             .fixed_decimals(2),
                     )
-                    .on_hover_text("EnKF nudging gain coupling agent flight altitude distributions toward observed NEXRAD / Aloft VPTS vertical density profiles");
+                    .on_hover_text("Data assimilation weight (0.00-1.00) nudging avian cruise altitudes toward observed NEXRAD/Aloft VPTS peak layer height and constraining EnKF RMSE.");
 
                     ui.add_space(6.0);
                     ui.separator();
@@ -1694,6 +1952,7 @@ impl AeroFlywayApp {
                                 .prefix("DOY ")
                                 .fixed_decimals(0),
                         )
+                        .on_hover_text("Annual Day-of-Year (1-365) driving solar declination, day length, seasonal temperature modulation, and flyway bearing.")
                         .changed()
                     {
                         self.params.season = SeasonPreset::from_doy(self.params.day_of_year);
@@ -1752,7 +2011,7 @@ impl AeroFlywayApp {
                         egui::Slider::new(&mut self.params.wind_850_multiplier, 0.2..=2.5)
                             .suffix("x"),
                     )
-                    .on_hover_text("Scaling factor on synoptic 850 hPa tailwind / headwind jet speeds governing groundspeed and energetic drift");
+                    .on_hover_text("Scaling factor (0.2-2.5x) on synoptic 850 hPa low-level jet wind vectors (u850, v850) governing avian groundspeed, drift, and wind-amplified urban strike hazard.");
 
                     ui.label("Precipitation Fallout Front (mm/hr)");
                     ui.add(
@@ -1786,6 +2045,9 @@ impl AeroFlywayApp {
                 });
             });
 
+        if let Some(preset) = chosen_preset {
+            self.apply_scenario_preset(preset);
+        }
         if let Some(reg) = jump_region {
             if reg != self.params.region {
                 self.apply_region_switch(reg);
@@ -1804,22 +2066,22 @@ impl AeroFlywayApp {
                     ui.selectable_value(
                         &mut self.bottom_tab,
                         BottomDockTab::AirspaceTransect,
-                        "Airspace Cross-Section (0-4,200 m ASL)",
+                        "[1] Airspace Cross-Section (0-4,200 m ASL)",
                     );
                     ui.selectable_value(
                         &mut self.bottom_tab,
                         BottomDockTab::RadarVerticalProfile,
-                        "NEXRAD / Aloft Vertical Profile (VPTS)",
+                        "[2] NEXRAD / Aloft Vertical Profile (VPTS)",
                     );
                     ui.selectable_value(
                         &mut self.bottom_tab,
                         BottomDockTab::AcousticSpectrogram,
-                        "WAV STFT Bioacoustic Inspector",
+                        "[3] WAV STFT Bioacoustic Inspector",
                     );
                     ui.selectable_value(
                         &mut self.bottom_tab,
                         BottomDockTab::BatchSweepLab,
-                        "Multi-Scenario Batch Sweep Lab",
+                        "[4] Multi-Scenario Batch Sweep Lab",
                     );
                 });
                 ui.separator();
@@ -1833,7 +2095,7 @@ impl AeroFlywayApp {
             });
     }
 
-    fn paint_transect_tab(&self, ui: &mut egui::Ui) {
+    fn paint_transect_tab(&mut self, ui: &mut egui::Ui) {
         let (total_km, terrain, cpu_points) = self.engine.compute_transect_slice(&self.params);
         let dem_src = if self.engine.cached_transect_dem.is_some() {
             "Copernicus GLO-90 Live DEM"
@@ -1869,11 +2131,12 @@ impl AeroFlywayApp {
 
         let inner = Rect::from_min_max(
             Pos2::new(plot_rect.min.x + 48.0, plot_rect.min.y + 10.0),
-            Pos2::new(plot_rect.max.x - 16.0, plot_rect.max.y - 20.0),
+            Pos2::new(plot_rect.max.x - 16.0, plot_rect.max.y - 22.0),
         );
         if inner.width() < 40.0 || inner.height() < 30.0 {
             return;
         }
+        self.last_transect_size_pts = (inner.width().max(1.0), inner.height().max(1.0));
 
         let max_elev_m = 4200.0_f64;
         let map_xz = |dist_km: f64, alt_asl_m: f64| -> Pos2 {
@@ -1918,6 +2181,35 @@ impl AeroFlywayApp {
                 Align2::RIGHT_CENTER,
                 format!("{elev:.0}m"),
                 FontId::monospace(10.0),
+                Color32::from_rgb(148, 163, 184),
+            );
+        }
+
+        // X-axis distance ticks (0 .. total_km)
+        for step in 0..=4 {
+            let frac = step as f32 / 4.0;
+            let x = inner.left() + frac * inner.width();
+            let dist_km = (frac as f64) * total_km;
+            if (1..=3).contains(&step) {
+                painter.line_segment(
+                    [Pos2::new(x, inner.top()), Pos2::new(x, inner.bottom())],
+                    Stroke::new(0.7_f32, Color32::from_rgba_unmultiplied(71, 85, 105, 60)),
+                );
+            }
+            painter.line_segment(
+                [Pos2::new(x, inner.bottom()), Pos2::new(x, inner.bottom() + 4.0)],
+                Stroke::new(1.0_f32, Color32::from_rgb(100, 116, 139)),
+            );
+            let (align, label) = match step {
+                0 => (Align2::LEFT_TOP, "0 km (A)".to_string()),
+                4 => (Align2::RIGHT_TOP, format!("{total_km:.0} km (B)")),
+                _ => (Align2::CENTER_TOP, format!("{dist_km:.0} km")),
+            };
+            painter.text(
+                Pos2::new(x, inner.bottom() + 5.0),
+                align,
+                label,
+                FontId::monospace(9.5),
                 Color32::from_rgb(148, 163, 184),
             );
         }
@@ -2065,7 +2357,7 @@ impl AeroFlywayApp {
         );
 
         let avail = ui.available_size();
-        let (outer, _) = ui.allocate_exact_size(avail, Sense::hover());
+        let (outer, resp) = ui.allocate_exact_size(avail, Sense::hover());
         let painter = ui.painter_at(outer);
 
         painter.rect_filled(outer, CornerRadius::same(4), Color32::from_rgb(8, 13, 22));
@@ -2109,7 +2401,30 @@ impl AeroFlywayApp {
         }
 
         let bar_h = (inner.height() / (active_prof.bins.len().max(1) as f32) - 2.0).clamp(2.5, 14.0);
-        for b in &active_prof.bins {
+        let row_pick_half_h = ((inner.height() / (active_prof.bins.len().max(1) as f32)) * 0.55)
+            .max(bar_h * 0.75)
+            .max(6.0);
+        let mut hovered_bin: Option<(usize, f32)> = None;
+        if let Some(hp) = resp.hover_pos() {
+            if hp.x >= inner.left() - 6.0
+                && hp.x <= outer.right() - 4.0
+                && hp.y >= inner.top() - 8.0
+                && hp.y <= inner.bottom() + 8.0
+            {
+                let mut best_dy = f32::MAX;
+                for (b_idx, b) in active_prof.bins.iter().enumerate() {
+                    let fy = (b.height_m_asl / max_h).clamp(0.0, 1.0) as f32;
+                    let cy = inner.bottom() - fy * inner.height();
+                    let dy = (hp.y - cy).abs();
+                    if dy <= row_pick_half_h && dy < best_dy {
+                        best_dy = dy;
+                        hovered_bin = Some((b_idx, cy));
+                    }
+                }
+            }
+        }
+
+        for (b_idx, b) in active_prof.bins.iter().enumerate() {
             let fy = (b.height_m_asl / max_h).clamp(0.0, 1.0) as f32;
             let cy = inner.bottom() - fy * inner.height();
             let w_frac = (b.bird_density_per_km3 / max_dens).clamp(0.0, 1.0) as f32;
@@ -2117,13 +2432,35 @@ impl AeroFlywayApp {
                 Pos2::new(inner.left(), cy - bar_h * 0.5),
                 Pos2::new(inner.left() + w_frac * inner.width(), cy + bar_h * 0.5),
             );
+            let is_hovered = hovered_bin.map(|(idx, _)| idx == b_idx).unwrap_or(false);
+            if is_hovered {
+                let row_rect = Rect::from_min_max(
+                    Pos2::new(inner.left(), cy - bar_h * 0.5 - 2.0),
+                    Pos2::new(outer.right() - 8.0, cy + bar_h * 0.5 + 2.0),
+                );
+                painter.rect_filled(
+                    row_rect,
+                    CornerRadius::same(2),
+                    Color32::from_rgba_unmultiplied(34, 211, 238, 28),
+                );
+            }
             let is_peak = (b.height_m_asl - active_prof.peak_altitude_m_asl).abs() < 110.0;
-            let fill = if is_peak {
+            let fill = if is_hovered {
+                Color32::from_rgb(103, 232, 249)
+            } else if is_peak {
                 Color32::from_rgb(34, 211, 238)
             } else {
                 Color32::from_rgba_unmultiplied(56, 189, 248, 185)
             };
             painter.rect_filled(bar_rect, CornerRadius::same(2), fill);
+            if is_hovered {
+                painter.rect_stroke(
+                    bar_rect.expand(1.0),
+                    CornerRadius::same(2),
+                    Stroke::new(1.2_f32, Color32::from_rgb(224, 242, 254)),
+                    StrokeKind::Outside,
+                );
+            }
 
             // Wind vector barb on right column
             let barb_origin = Pos2::new(inner.right() + 48.0, cy);
@@ -2131,7 +2468,10 @@ impl AeroFlywayApp {
             painter.arrow(
                 barb_origin,
                 vec_px,
-                Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(167, 243, 208, 195)),
+                Stroke::new(
+                    if is_hovered { 1.8 } else { 1.2_f32 },
+                    Color32::from_rgba_unmultiplied(167, 243, 208, if is_hovered { 255 } else { 195 }),
+                ),
             );
         }
 
@@ -2149,6 +2489,26 @@ impl AeroFlywayApp {
             FontId::monospace(9.5),
             Color32::from_rgb(167, 243, 208),
         );
+
+        if let Some((b_idx, _)) = hovered_bin {
+            if let Some(b) = active_prof.bins.get(b_idx) {
+                let speed_mps = b.u_mps.hypot(b.v_mps);
+                let dir_deg = (b.u_mps.atan2(b.v_mps).to_degrees() + 360.0) % 360.0;
+                resp.on_hover_text(format!(
+                    "{} @ {:.0} m ASL\nDensity: {:.2} birds/km^3\nReflectivity eta: {:.1} cm^2/km^3\nGround speed: {:.1} m/s ({:.0} km/h, track {:.0}°)\nWind (u, v): ({:+.1}, {:+.1}) m/s\nsd_vvp: {:.2} m/s",
+                    active_prof.station_code,
+                    b.height_m_asl,
+                    b.bird_density_per_km3,
+                    b.reflectivity_eta,
+                    speed_mps,
+                    speed_mps * 3.6,
+                    dir_deg,
+                    b.u_mps,
+                    b.v_mps,
+                    b.sd_vvp_mps,
+                ));
+            }
+        }
     }
 
     fn paint_acoustic_tab(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -2281,6 +2641,7 @@ impl AeroFlywayApp {
                         .text("dB floor")
                         .fixed_decimals(0),
                 )
+                .on_hover_text("Minimum spectral power floor (dBFS) mapped to the bottom of the Magma colormap.")
                 .changed()
             {
                 self.acoustics.texture_dirty = true;
@@ -2304,6 +2665,7 @@ impl AeroFlywayApp {
                         .text("Max kHz")
                         .fixed_decimals(1),
                 )
+                .on_hover_text("Upper displayed frequency bound (kHz, up to Nyquist sample_rate / 2).")
                 .changed()
             {
                 self.acoustics.texture_dirty = true;
@@ -2854,38 +3216,14 @@ impl AeroFlywayApp {
             }
 
             let tiles = self.map.visible_world_tiles(ctx, canvas_rect);
-            let tint = match self.map.provider {
+            let base_rgba = match self.map.provider {
                 BasemapProvider::OpenStreetMap | BasemapProvider::UsgsNationalTopo => {
-                    Color32::from_rgba_unmultiplied(185, 198, 215, 210)
+                    [185_u8, 198, 215, 210]
                 }
-                _ => Color32::WHITE,
+                _ => [255_u8, 255, 255, 255],
             };
-            for tile in tiles {
-                let mut mesh = egui::epaint::Mesh::with_texture(tile.texture.id());
-                for iy in 0..=2_u32 {
-                    let v = (iy as f32) * 0.5;
-                    let wy = tile.min_wy + (tile.max_wy - tile.min_wy) * (v as f64);
-                    for ix in 0..=2_u32 {
-                        let u = (ix as f32) * 0.5;
-                        let wx = tile.min_wx + (tile.max_wx - tile.min_wx) * (u as f64);
-                        let (sp, _) = self.map.project_world_px(wx, wy, 0.0, canvas_rect);
-                        mesh.vertices.push(egui::epaint::Vertex {
-                            pos: sp,
-                            uv: Pos2::new(u, v),
-                            color: tint,
-                        });
-                    }
-                }
-                for iy in 0..2_u32 {
-                    for ix in 0..2_u32 {
-                        let i0 = iy * 3 + ix;
-                        let i1 = i0 + 1;
-                        let i2 = i0 + 3;
-                        let i3 = i2 + 1;
-                        mesh.add_triangle(i0, i1, i3);
-                        mesh.add_triangle(i0, i3, i2);
-                    }
-                }
+            for tile in &tiles {
+                let mesh = build_tilted_tile_mesh_4x4(&self.map, tile, base_rgba, canvas_rect);
                 painter.add(egui::Shape::mesh(mesh));
             }
 
@@ -2989,6 +3327,8 @@ impl AeroFlywayApp {
                     self.map.alt_exaggeration,
                     canvas_rect.width(),
                     canvas_rect.height(),
+                    self.last_transect_size_pts.0,
+                    self.last_transect_size_pts.1,
                     self.last_frame_sim_dt_hr,
                     self.engine.metrics.hour_of_day,
                     self.engine.metrics.day_of_year,
@@ -3677,6 +4017,71 @@ fn aero_heading_rad(params: &SimulationParams, active_doy: f64) -> f64 {
     aeroflyway::physics::annual_flyway_heading_deg(params.region, active_doy).to_radians()
 }
 
+/// Computes atmospheric horizon fade factor (`0.14..=1.0`) for 2.5D tilted basemap vertices.
+/// Returns `1.0` in 2D plan view (`pitch_deg <= 1.0`) and gently attenuates far-horizon tile
+/// vertices (`persp < 0.78` or near top viewport edge) into the dark background sky.
+fn compute_tile_horizon_fade(
+    pitch_deg: f64,
+    persp: f32,
+    screen_y: f32,
+    canvas_rect: Rect,
+) -> f32 {
+    if pitch_deg <= 1.0 {
+        return 1.0;
+    }
+    let pitch_t = ((pitch_deg as f32 - 1.0) / 61.0).clamp(0.0, 1.0);
+    let persp_fade = ((persp - 0.34) / 0.44).clamp(0.0, 1.0);
+    let top_norm = ((screen_y - canvas_rect.top()) / (canvas_rect.height().max(1.0) * 0.28))
+        .clamp(0.0, 1.0);
+    let horizon_atten = persp_fade.min(0.30 + 0.70 * top_norm);
+    (1.0 - pitch_t * (1.0 - horizon_atten)).clamp(0.14, 1.0)
+}
+
+/// Subdivides a projected Web Mercator raster basemap tile into a `4x4` grid (`32` triangles)
+/// with per-vertex atmospheric horizon fade so oblique 2.5D perspective distortion stays smooth.
+fn build_tilted_tile_mesh_4x4(
+    map: &MapViewport,
+    tile: &aeroflyway::map_engine::ProjectedTile,
+    base_rgba: [u8; 4],
+    canvas_rect: Rect,
+) -> egui::epaint::Mesh {
+    const SUBDIV: u32 = 4;
+    let stride = SUBDIV + 1;
+    let step = 1.0_f32 / (SUBDIV as f32);
+    let mut mesh = egui::epaint::Mesh::with_texture(tile.texture.id());
+    mesh.vertices.reserve((stride * stride) as usize);
+
+    for iy in 0..=SUBDIV {
+        let v = (iy as f32) * step;
+        let wy = tile.min_wy + (tile.max_wy - tile.min_wy) * (v as f64);
+        for ix in 0..=SUBDIV {
+            let u = (ix as f32) * step;
+            let wx = tile.min_wx + (tile.max_wx - tile.min_wx) * (u as f64);
+            let (sp, persp) = map.project_world_px(wx, wy, 0.0, canvas_rect);
+            let fade = compute_tile_horizon_fade(map.pitch_deg, persp, sp.y, canvas_rect);
+            let alpha = ((base_rgba[3] as f32) * fade).round().clamp(0.0, 255.0) as u8;
+            let color =
+                Color32::from_rgba_unmultiplied(base_rgba[0], base_rgba[1], base_rgba[2], alpha);
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: sp,
+                uv: Pos2::new(u, v),
+                color,
+            });
+        }
+    }
+    for iy in 0..SUBDIV {
+        for ix in 0..SUBDIV {
+            let i0 = iy * stride + ix;
+            let i1 = i0 + 1;
+            let i2 = i0 + stride;
+            let i3 = i2 + 1;
+            mesh.add_triangle(i0, i1, i3);
+            mesh.add_triangle(i0, i3, i2);
+        }
+    }
+    mesh
+}
+
 fn paint_taxon_silhouette(
     painter: &egui::Painter,
     taxon: Taxon,
@@ -4239,6 +4644,213 @@ mod tests {
         assert_eq!(app.active_campaign.campaign_name, "Shortcut Persisted Campaign");
         assert!(app.status_line.contains("Saved campaign 'Shortcut Persisted Campaign'"));
         assert_ne!(app.active_campaign.updated_at, "2026-11-14T04:10Z");
+
+        drop(app);
+        cleanup_db(&db_path);
+    }
+
+    #[test]
+    fn headless_new_shortcuts_text_guard_scenarios_and_4x4_tile_mesh() {
+        let db_path = temp_db("new_ux");
+        cleanup_db(&db_path);
+
+        let ctx = egui::Context::default();
+        let mut app = AeroFlywayApp::new_with_wgpu(&ctx, None, db_path.clone(), true);
+        app.running = false;
+
+        let key_evt = |key: egui::Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        // Tabs 1-4
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            vec![key_evt(egui::Key::Num2)],
+            Vec::new(),
+        );
+        assert_eq!(app.bottom_tab, BottomDockTab::RadarVerticalProfile);
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            vec![key_evt(egui::Key::Num3)],
+            Vec::new(),
+        );
+        assert_eq!(app.bottom_tab, BottomDockTab::AcousticSpectrogram);
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            vec![key_evt(egui::Key::Num4)],
+            Vec::new(),
+        );
+        assert_eq!(app.bottom_tab, BottomDockTab::BatchSweepLab);
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            vec![key_evt(egui::Key::Num1)],
+            Vec::new(),
+        );
+        assert_eq!(app.bottom_tab, BottomDockTab::AirspaceTransect);
+
+        // T / M tool mode toggles
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            vec![key_evt(egui::Key::T)],
+            Vec::new(),
+        );
+        assert_eq!(app.tool_mode, MapToolMode::DrawTransect);
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            vec![key_evt(egui::Key::T)],
+            Vec::new(),
+        );
+        assert_eq!(app.tool_mode, MapToolMode::PanAndInspect);
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            vec![key_evt(egui::Key::M)],
+            Vec::new(),
+        );
+        assert_eq!(app.tool_mode, MapToolMode::PlantVirtualMilkweed);
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            vec![key_evt(egui::Key::M)],
+            Vec::new(),
+        );
+        assert_eq!(app.tool_mode, MapToolMode::PanAndInspect);
+
+        // L Lights-Out toggle updates status_line
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            vec![key_evt(egui::Key::L)],
+            Vec::new(),
+        );
+        assert!((app.params.lights_out_curfew_pct - 85.0).abs() < 1e-6);
+        assert!(app.status_line.contains("Lights-Out curfew ON"));
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            vec![key_evt(egui::Key::L)],
+            Vec::new(),
+        );
+        assert!((app.params.lights_out_curfew_pct - 0.0).abs() < 1e-6);
+        assert!(app.status_line.contains("Lights-Out curfew OFF"));
+
+        // 0 and R camera reset
+        app.map.jump_to(40.0, -120.0, 9.5);
+        app.map.pitch_deg = 10.0;
+        app.map.bearing_deg = 55.0;
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            vec![key_evt(egui::Key::Num0)],
+            Vec::new(),
+        );
+        let (def_lat, def_lon, def_zoom) = app.params.region.default_viewport();
+        assert!((app.map.center_lat - def_lat).abs() < 1e-6);
+        assert!((app.map.center_lon - def_lon).abs() < 1e-6);
+        assert!((app.map.zoom - def_zoom).abs() < 1e-6);
+        assert!((app.map.pitch_deg - 42.0).abs() < 1e-6);
+        assert!((app.map.bearing_deg - (-18.0)).abs() < 1e-6);
+
+        app.map.jump_to(39.0, -119.0, 8.5);
+        app.map.pitch_deg = 0.0;
+        step_app_with_input(
+            &mut app,
+            &ctx,
+            egui::Modifiers::NONE,
+            vec![key_evt(egui::Key::R)],
+            Vec::new(),
+        );
+        assert!((app.map.center_lat - def_lat).abs() < 1e-6);
+        assert!((app.map.pitch_deg - 42.0).abs() < 1e-6);
+
+        // TextEdit focus guard prevents single-key shortcuts from firing
+        let text_id = egui::Id::new("focused_text_guard_test");
+        let mut buf = String::new();
+        let _ = ctx.run(egui::RawInput::default(), |c| {
+            egui::CentralPanel::default().show(c, |ui| {
+                let resp = ui.add(egui::TextEdit::singleline(&mut buf).id(text_id));
+                resp.request_focus();
+            });
+        });
+        assert!(ctx.wants_keyboard_input());
+        app.map.pitch_deg = 12.0;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+                events: vec![
+                    key_evt(egui::Key::Num2),
+                    key_evt(egui::Key::T),
+                    key_evt(egui::Key::L),
+                    key_evt(egui::Key::R),
+                ],
+                ..Default::default()
+            },
+            |c| {
+                egui::CentralPanel::default().show(c, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut buf).id(text_id));
+                });
+                app.handle_keyboard_shortcuts(c);
+            },
+        );
+        assert_eq!(app.bottom_tab, BottomDockTab::AirspaceTransect);
+        assert_eq!(app.tool_mode, MapToolMode::PanAndInspect);
+        assert!((app.params.lights_out_curfew_pct - 0.0).abs() < 1e-6);
+        assert!((app.map.pitch_deg - 12.0).abs() < 1e-6);
+
+        // 3 Scenario presets
+        app.apply_scenario_preset(ScenarioPreset::MegafireSmokeSsp585);
+        assert_eq!(app.params.cmip6_scenario, Cmip6Scenario::Ssp585High);
+        assert!((app.params.smoke_pm25_offset_ugm3 - 195.0).abs() < 1e-6);
+        app.apply_scenario_preset(ScenarioPreset::SpringFalloutUnmitigated);
+        assert_eq!(app.params.season, SeasonPreset::SpringNorthbound);
+        assert!((app.params.lights_out_curfew_pct - 0.0).abs() < 1e-6);
+        app.apply_scenario_preset(ScenarioPreset::AutumnLightsOutPeak);
+        assert!((app.params.lights_out_curfew_pct - 85.0).abs() < 1e-6);
+
+        // 4x4 tilted tile mesh & horizon fade checks
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0));
+        let fade_2d = compute_tile_horizon_fade(0.0, 0.35, 10.0, canvas);
+        assert!((fade_2d - 1.0).abs() < 1e-6);
+        let fade_center = compute_tile_horizon_fade(48.0, 1.0, 350.0, canvas);
+        let fade_horizon = compute_tile_horizon_fade(48.0, 0.36, 12.0, canvas);
+        assert!(fade_horizon < fade_center && fade_horizon >= 0.14);
+
+        let tex = ctx.load_texture(
+            "test_tile_4x4",
+            egui::ColorImage::example(),
+            TextureOptions::LINEAR,
+        );
+        let tile = aeroflyway::map_engine::ProjectedTile {
+            min_wx: 0.0,
+            min_wy: 0.0,
+            max_wx: 256.0,
+            max_wy: 256.0,
+            texture: tex,
+        };
+        let mesh = build_tilted_tile_mesh_4x4(&app.map, &tile, [255, 255, 255, 255], canvas);
+        assert_eq!(mesh.vertices.len(), 25, "4x4 tile grid requires 5x5=25 vertices");
+        assert_eq!(mesh.indices.len(), 96, "4x4 tile grid requires 32 triangles (96 indices)");
 
         drop(app);
         cleanup_db(&db_path);

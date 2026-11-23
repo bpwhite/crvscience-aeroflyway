@@ -135,6 +135,27 @@ pub fn is_lights_out_curfew_active(hour_of_day: f64) -> bool {
     !(6.0..23.0).contains(&hour_of_day)
 }
 
+/// Computes the BirdCast / Audubon `Lights-Out` skyglow dimming multiplier (`0.12..=1.0`):
+/// - During active curfew (`23:00-06:00`): `1.0 - 0.88 * (lights_out_curfew_pct / 100.0)`
+/// - During early dusk/dawn nocturnal shoulder (`06:00-23:00`): `1.0 - 0.32 * (lights_out_curfew_pct / 100.0)`
+/// - During daylight (`!is_nocturnal`): `0.0`
+pub fn compute_skyglow_curfew_dim(
+    hour_of_day: f64,
+    is_nocturnal: bool,
+    lights_out_curfew_pct: f64,
+) -> f64 {
+    if !is_nocturnal {
+        return 0.0;
+    }
+    let frac = lights_out_curfew_pct.clamp(0.0, 100.0) / 100.0;
+    if is_lights_out_curfew_active(hour_of_day) {
+        1.0 - 0.88 * frac
+    } else {
+        // Early dusk shoulder dimming (35% of peak curfew compliance)
+        1.0 - 0.32 * frac
+    }
+}
+
 /// Computes effective VIIRS urban skyglow radiance (`nW/cm^2/sr`) accounting for nocturnal phase,
 /// anthropogenic skyglow multiplier, and `Lights-Out` curfew window dimming (`0..=100%`).
 pub fn effective_skyglow_radiance_nw(
@@ -144,16 +165,22 @@ pub fn effective_skyglow_radiance_nw(
     lights_out_curfew_pct: f64,
     skyglow_mult: f64,
 ) -> f64 {
-    if !is_nocturnal {
-        return 0.0;
-    }
-    let curfew_dim = if is_lights_out_curfew_active(hour_of_day) {
-        1.0 - 0.88 * (lights_out_curfew_pct.clamp(0.0, 100.0) / 100.0)
-    } else {
-        // Early dusk shoulder dimming (35% of peak curfew compliance)
-        1.0 - 0.32 * (lights_out_curfew_pct.clamp(0.0, 100.0) / 100.0)
-    };
+    let curfew_dim = compute_skyglow_curfew_dim(hour_of_day, is_nocturnal, lights_out_curfew_pct);
     (peak_radiance_nw * skyglow_mult.clamp(0.0, 3.0) * curfew_dim).max(0.0)
+}
+
+/// Continuous-time hourly bat rotor-zone collision hazard rate (`hr^-1`) used by `compute.wgsl`.
+pub const BAT_TURBINE_COLLISION_RATE_PER_HR: f64 = 0.16;
+
+/// Continuous-time Poisson step probability `1 - exp(-rate * dt)` invariant under sub-stepping.
+pub fn turbine_collision_step_prob(rate_per_hr: f64, dt_hours: f64) -> f64 {
+    1.0 - (-rate_per_hr.max(0.0) * dt_hours.max(0.0)).exp()
+}
+
+/// Metric `cos(lat)`-scaled longitude half-width (deg) matching a `half_lat_deg` latitude box.
+pub fn turbine_box_half_lon_deg(half_lat_deg: f64, lat_deg: f64) -> f64 {
+    let cos_lat = lat_deg.to_radians().cos().abs().max(0.2);
+    half_lat_deg / cos_lat
 }
 
 /// Analytical expectation of nocturnal building-collision mortality avoided (%) for a given
@@ -704,7 +731,10 @@ impl AeroPhysicsEngine {
                             agent.alt_agl_m = (agent.alt_agl_m + jitter_b * 28.0).clamp(40.0, 300.0);
 
                             for t in turbines {
-                                if (agent.lat - t.lat).abs() < 0.045 && (agent.lon - t.lon).abs() < 0.055 {
+                                let cos_t_lat = t.lat.to_radians().cos().abs().max(0.2);
+                                if (agent.lat - t.lat).abs() < 0.045
+                                    && (agent.lon - t.lon).abs() * cos_t_lat < 0.045
+                                {
                                     let r_rad = t.rotor_diameter_m * 0.5;
                                     let z_min = (t.hub_height_m - r_rad).max(15.0);
                                     let z_max = t.hub_height_m + r_rad;

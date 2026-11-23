@@ -29,8 +29,8 @@ use crate::basemap::{
 use crate::ingest::SynopticNodeWeather;
 use crate::map_engine::haversine_km;
 use crate::physics::{
-    annual_flyway_heading_deg, compute_trophic_mismatch_days, effective_skyglow_radiance_nw,
-    SeasonPreset, SimulationParams,
+    annual_flyway_heading_deg, compute_skyglow_curfew_dim, compute_trophic_mismatch_days,
+    effective_skyglow_radiance_nw, SeasonPreset, SimulationParams,
 };
 use bytemuck::{Pod, Zeroable};
 use eframe::wgpu::util::DeviceExt;
@@ -45,7 +45,7 @@ const MAX_WEATHER_NODES: usize = 16;
 const MAX_TURBINES: usize = 512;
 const MAX_ATTRACTORS: usize = 256;
 
-/// 44-scalar (`176-byte`, 11 x `vec4`) uniform block shared identically across `compute.wgsl`,
+/// 48-scalar (`192-byte`, 12 x `vec4`) uniform block shared identically across `compute.wgsl`,
 /// `map_render.wgsl`, and `transect_render.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -103,7 +103,12 @@ pub struct GpuSimUniforms {
     pub cam_pitch_rad: f32,
     pub cam_bearing_rad: f32,
     pub cam_alt_exag: f32,
-    pub _cam_pad: f32,
+    pub curfew_dim: f32,
+
+    pub transect_w_pts: f32,
+    pub transect_h_pts: f32,
+    pub transect_aspect: f32,
+    pub _uniform_pad: f32,
 }
 
 #[repr(C)]
@@ -636,7 +641,7 @@ impl egui_wgpu::CallbackTrait for MapGpuSimAndPaintCallback {
         }
         render_pass.set_pipeline(&res.map_render_pipeline);
         render_pass.set_bind_group(0, &res.render_bind_group, &[]);
-        render_pass.draw(0..6, 0..count);
+        render_pass.draw(0..18, 0..count);
     }
 }
 
@@ -674,6 +679,8 @@ pub fn pack_gpu_uniforms(
     alt_exaggeration: f64,
     canvas_w_pts: f32,
     canvas_h_pts: f32,
+    transect_w_pts: f32,
+    transect_h_pts: f32,
     dt_hours: f64,
     hour_of_day: f64,
     active_doy: f64,
@@ -729,6 +736,11 @@ pub fn pack_gpu_uniforms(
     let heading_rad = annual_flyway_heading_deg(params.region, active_doy).to_radians() as f32;
     let total_warming = params.total_warming_c();
     let mismatch_days = compute_trophic_mismatch_days(total_warming, mean_corridor_pm25);
+    let curfew_dim =
+        compute_skyglow_curfew_dim(hour_of_day, is_nocturnal, params.lights_out_curfew_pct) as f32;
+    let tw = transect_w_pts.max(1.0);
+    let th = transect_h_pts.max(1.0);
+    let transect_aspect = tw / th;
 
     GpuSimUniforms {
         center_lat: center_lat as f32,
@@ -774,7 +786,11 @@ pub fn pack_gpu_uniforms(
         cam_pitch_rad: pitch_deg.clamp(0.0, 62.0).to_radians() as f32,
         cam_bearing_rad: bearing_deg.to_radians() as f32,
         cam_alt_exag: alt_exaggeration.max(0.0) as f32,
-        _cam_pad: 0.0,
+        curfew_dim,
+        transect_w_pts: tw,
+        transect_h_pts: th,
+        transect_aspect,
+        _uniform_pad: 0.0,
     }
 }
 

@@ -236,7 +236,7 @@ pub fn parse_vpts_csv_text(
             r_lon = ln;
         }
 
-        let key_m = ((height_m / 200.0).round() as i32) * 200;
+        let key_m = height_m.round() as i32;
         let entry = gate_map.entry(key_m).or_insert((0.0, 0.0, 0.0, 0.0, 0.0, 0));
         entry.0 += bio_dens;
         entry.1 += u_val;
@@ -288,15 +288,37 @@ pub fn load_vpts_csv_file(
     parse_vpts_csv_text(&raw, fallback_station)
 }
 
+/// Integrates Migration Traffic Rate (`MTR`, birds/km/hr) across altitude bins using each gate's
+/// actual vertical layer thickness `Δh` (km) computed from adjacent sorted bin centers, and returns
+/// `(mtr_birds_km_hr, peak_altitude_m_asl)`.
 pub fn summarize_profile_mtr_and_peak(bins: &[RadarAltitudeBin]) -> (f64, f64) {
     if bins.is_empty() {
         return (0.0, 950.0);
     }
-    let layer_thickness_km = 0.2_f64;
+    let mut ordered: Vec<&RadarAltitudeBin> = bins.iter().collect();
+    ordered.sort_by(|a, b| {
+        a.height_m_asl
+            .partial_cmp(&b.height_m_asl)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let n = ordered.len();
     let mut mtr = 0.0_f64;
     let mut best_dens = -1.0_f64;
     let mut peak_alt = 950.0_f64;
-    for b in bins {
+
+    for (i, b) in ordered.iter().enumerate() {
+        let dh_m = if n == 1 {
+            200.0
+        } else if i == 0 {
+            ordered[1].height_m_asl - ordered[0].height_m_asl
+        } else if i == n - 1 {
+            ordered[n - 1].height_m_asl - ordered[n - 2].height_m_asl
+        } else {
+            0.5 * (ordered[i + 1].height_m_asl - ordered[i - 1].height_m_asl)
+        };
+        let effective_dh_m = if dh_m > 0.0 { dh_m } else { 200.0 };
+        let layer_thickness_km = effective_dh_m / 1000.0;
         let speed_km_hr = b.u_mps.hypot(b.v_mps) * 3.6;
         mtr += b.bird_density_per_km3 * speed_km_hr * layer_thickness_km;
         if b.bird_density_per_km3 > best_dens {

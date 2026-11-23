@@ -77,7 +77,12 @@ struct SimUniforms {
     cam_pitch_rad: f32,
     cam_bearing_rad: f32,
     cam_alt_exag: f32,
-    _cam_pad: f32,
+    curfew_dim: f32,
+
+    transect_w_pts: f32,
+    transect_h_pts: f32,
+    transect_aspect: f32,
+    _uniform_pad: f32,
 };
 
 struct GpuAgent {
@@ -340,7 +345,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     ag.energy = max(ag.energy - 0.025 * sim.dt_hours, 0.04);
 
                     // Non-linear Lights-Out vs unmitigated collision counter (Van Doren et al. 2021)
-                    let curfew_dim = max(1.0 - 0.88 * clamp(sim.lights_out_pct / 100.0, 0.0, 1.0), 0.10);
+                    // Use exact curfew_dim factor passed in SimUniforms (0.32 dusk vs 0.88 curfew)
+                    let curfew_dim = max(sim.curfew_dim, 0.08);
                     let unmit_glow = best_glow / curfew_dim;
                     let wind_amp = clamp(1.0 + 0.035 * ws850, 1.0, 1.6);
                     let p_base = 0.0032 * pow(max(unmit_glow / 100.0, 0.05), 1.68) * wind_amp * min(sim.dt_hours, 1.2);
@@ -412,14 +418,19 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 ag.vel_v_mps = airspeed * dir_v + 0.45 * v80 + jitter_b * 1.9;
                 ag.alt_agl_m = clamp(ag.alt_agl_m + jitter_b * 30.0, 40.0, 300.0);
 
+                let bat_collision_rate_hr = 0.16;
+                let bat_hit_prob = 1.0 - exp(-bat_collision_rate_hr * max(sim.dt_hours, 0.0));
                 for (var t_i: u32 = 0u; t_i < sim.num_turbines; t_i = t_i + 1u) {
                     let tb = turbines[t_i];
-                    if ((abs(ag.lat - tb.lat) < 0.032) && (abs(ag.lon - tb.lon) < 0.042)) {
+                    let cos_tb_lat = max(abs(cos(tb.lat * 0.01745329252)), 0.2);
+                    let dlat_deg = abs(ag.lat - tb.lat);
+                    let dlon_metric_deg = abs(ag.lon - tb.lon) * cos_tb_lat;
+                    if ((dlat_deg < 0.032) && (dlon_metric_deg < 0.032)) {
                         let z_lo = max(tb.hub_height_m - tb.rotor_radius_m, 15.0);
                         let z_hi = tb.hub_height_m + tb.rotor_radius_m;
                         if ((ag.alt_agl_m >= z_lo) && (ag.alt_agl_m <= z_hi)) {
                             ag.flags = ag.flags | 2u;
-                            if (rand_unit(seed_a ^ 0xA5A55A5Au) < 0.08) {
+                            if (rand_unit(seed_a ^ 0xA5A55A5Au) < bat_hit_prob) {
                                 if ((ws80 >= 3.0) && (ws80 <= 25.0)) {
                                     atomicAdd(&counters.bat_baseline_hits, 1u);
                                 }

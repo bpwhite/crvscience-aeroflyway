@@ -71,7 +71,12 @@ struct SimUniforms {
     cam_pitch_rad: f32,
     cam_bearing_rad: f32,
     cam_alt_exag: f32,
-    _cam_pad: f32,
+    curfew_dim: f32,
+
+    transect_w_pts: f32,
+    transect_h_pts: f32,
+    transect_aspect: f32,
+    _uniform_pad: f32,
 };
 
 struct GpuAgent {
@@ -125,6 +130,12 @@ fn terrain_elev_m(lat: f32, lon: f32) -> f32 {
         let hd_y = (lat - 45.374) / 0.12;
         let hd_x = (lon + 121.696) / 0.14;
         let hood = 1550.0 * exp(-(hd_y * hd_y + hd_x * hd_x));
+        let sis_y = (lat - 44.103) / 0.15;
+        let sis_x = (lon + 121.769) / 0.15;
+        let sisters = 1320.0 * exp(-(sis_y * sis_y + sis_x * sis_x));
+        let sh_y = (lat - 41.409) / 0.16;
+        let sh_x = (lon + 122.195) / 0.16;
+        let shasta = 2350.0 * exp(-(sh_y * sh_y + sh_x * sh_x));
         let gc_y = (lat - 45.65) / 0.11;
         let gorge_cut = 1.0 - 0.82 * exp(-(gc_y * gc_y));
         var east_plateau = 0.0;
@@ -132,21 +143,27 @@ fn terrain_elev_m(lat: f32, lon: f32) -> f32 {
             let ep_x = (lon + 121.3) / 0.6;
             east_plateau = 980.0 * (1.0 - exp(-(ep_x * ep_x)));
         }
-        return clamp(valley_floor + coast_range + (cascade_ridge + hood) * gorge_cut + east_plateau, 0.0, 4350.0);
+        return clamp(valley_floor + coast_range + (cascade_ridge + hood + sisters + shasta) * gorge_cut + east_plateau, 0.0, 4350.0);
     }
     if ((lon >= -105.0) && (lon < -90.0) && (lat >= 25.0) && (lat <= 48.0)) {
-        return clamp(max(-lon - 94.0, 0.0) * 105.0, 15.0, 1650.0);
+        let plains_slope = clamp(max(-lon - 94.0, 0.0) * 105.0, 15.0, 1450.0);
+        let hc_y = (lat - 30.2) / 1.4;
+        let hc_x = (lon + 99.0) / 1.6;
+        let hill_country = 320.0 * exp(-(hc_y * hc_y + hc_x * hc_x));
+        return clamp(plains_slope + hill_country, 0.0, 2800.0);
     }
     if ((lon >= -83.0) && (lon <= -68.0) && (lat >= 24.0) && (lat <= 46.0)) {
         let app_x = (lon + 78.6 + (lat - 38.0) * 0.45) / 0.95;
-        return clamp(45.0 + 920.0 * exp(-(app_x * app_x)), 0.0, 2100.0);
+        let coastal = select(85.0, 12.0, lon > -75.4);
+        return clamp(coastal + 920.0 * exp(-(app_x * app_x)), 0.0, 2100.0);
     }
     if ((lon >= -12.0) && (lon <= 18.0) && (lat >= 33.0) && (lat <= 58.0)) {
         let pyr_y = (lat - 42.8) / 0.55;
         let pyr_x = (lon + 0.5) / 2.2;
         let bet_y = (lat - 37.05) / 0.45;
         let bet_x = (lon + 3.4) / 1.6;
-        return clamp(75.0 + 1950.0 * exp(-(pyr_y * pyr_y + pyr_x * pyr_x)) + 1280.0 * exp(-(bet_y * bet_y + bet_x * bet_x)), 0.0, 3400.0);
+        let base_e = 55.0 + 90.0 * abs(sin(lat * 0.4));
+        return clamp(base_e + 1950.0 * exp(-(pyr_y * pyr_y + pyr_x * pyr_x)) + 1280.0 * exp(-(bet_y * bet_y + bet_x * bet_x)), 0.0, 3400.0);
     }
     if ((lon >= 98.0) && (lon <= 127.0) && (lat >= 20.0) && (lat <= 50.0)) {
         var step_m = 38.0;
@@ -154,7 +171,10 @@ fn terrain_elev_m(lat: f32, lon: f32) -> f32 {
             let mg = max(lat - 39.5, 0.0) / 3.2;
             step_m = 1180.0 * (1.0 - exp(-(mg * mg)));
         }
-        return clamp(step_m, 0.0, 3200.0);
+        let lu_y = (lat - 29.55) / 0.25;
+        let lu_x = (lon - 115.98) / 0.25;
+        let lushan = 980.0 * exp(-(lu_y * lu_y + lu_x * lu_x));
+        return clamp(step_m + lushan, 0.0, 3200.0);
     }
     return 120.0;
 }
@@ -210,8 +230,12 @@ fn vs_main(
     let fy = clamp(alt_asl / 4200.0, 0.0, 1.0);
 
     let uv = quad_uv(vert_idx);
-    let r_ndc_x = 2.4 / 420.0;
-    let r_ndc_y = 2.4 / 90.0;
+    let tw = max(sim.transect_w_pts, 1.0);
+    let th = max(sim.transect_h_pts, 1.0);
+    let aspect = max(sim.transect_aspect, tw / th);
+    let sprite_r_pts = 2.6;
+    let r_ndc_y = (2.0 * sprite_r_pts) / th;
+    let r_ndc_x = r_ndc_y / max(aspect, 0.05);
     let ndc_x = (t_proj * 2.0 - 1.0) + uv.x * r_ndc_x;
     let ndc_y = (fy * 2.0 - 1.0) + uv.y * r_ndc_y;
 

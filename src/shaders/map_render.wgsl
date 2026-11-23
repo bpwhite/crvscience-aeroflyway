@@ -72,7 +72,12 @@ struct SimUniforms {
     cam_pitch_rad: f32,
     cam_bearing_rad: f32,
     cam_alt_exag: f32,
-    _cam_pad: f32,
+    curfew_dim: f32,
+
+    transect_w_pts: f32,
+    transect_h_pts: f32,
+    transect_aspect: f32,
+    _uniform_pad: f32,
 };
 
 struct GpuAgent {
@@ -101,6 +106,8 @@ struct VsOut {
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) taxon: u32,
     @location(3) wing_phase: f32,
+    @location(4) @interpolate(flat) part_kind: u32,
+    @location(5) depth_fade: f32,
 };
 
 fn quad_corner(v_idx: u32) -> vec2<f32> {
@@ -120,21 +127,30 @@ fn vs_main(
     @builtin(instance_index) inst_idx: u32,
 ) -> VsOut {
     var out: VsOut;
+    let part = vert_idx / 6u;
+    let corner_idx = vert_idx % 6u;
+
     if (inst_idx >= sim.agent_count) {
-        out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        out.clip_pos = vec4<f32>(2.0, 2.0, 0.5, 1.0);
         out.local_uv = vec2<f32>(0.0, 0.0);
         out.color = vec4<f32>(0.0);
         out.taxon = 0u;
+        out.wing_phase = 0.0;
+        out.part_kind = 2u;
+        out.depth_fade = 1.0;
         return out;
     }
 
     let ag = agents[inst_idx];
     let taxon_bit = 1u << min(ag.taxon, 2u);
     if ((sim.layer_bits & taxon_bit) == 0u) {
-        out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        out.clip_pos = vec4<f32>(2.0, 2.0, 0.5, 1.0);
         out.local_uv = vec2<f32>(0.0, 0.0);
         out.color = vec4<f32>(0.0);
         out.taxon = ag.taxon;
+        out.wing_phase = 0.0;
+        out.part_kind = 2u;
+        out.depth_fade = 1.0;
         return out;
     }
 
@@ -156,52 +172,58 @@ fn vs_main(
     let fy = ge * sb + gn * cb;
     let elev_z = (ag.alt_agl_m / 36.0) * max(sim.cam_alt_exag, 0.0);
     let cam_d = max(sim.canvas_h_pts * 1.15, 680.0);
+    let z_near = cam_d * 0.22;
+    let z_far = cam_d * 8.0;
+
     let depth = fy * sp - elev_z * cp;
-    let persp = cam_d / max(cam_d + depth, cam_d * 0.22);
+    let view_z = max(cam_d + depth, z_near);
+    let persp = cam_d / view_z;
+    let z_ndc = clamp((z_far * (view_z - z_near)) / (view_z * (z_far - z_near)), 0.001, 0.999);
+
+    let g_depth = fy * sp;
+    let g_view_z = max(cam_d + g_depth, z_near);
+    let g_persp = cam_d / g_view_z;
+    let g_z_ndc = clamp((z_far * (g_view_z - z_near)) / (g_view_z * (z_far - z_near)), 0.001, 0.999);
 
     let sx_pts = rx * persp;
     let sy_pts = -((fy * cp + elev_z * sp) * persp);
+    let gx_pts = rx * g_persp;
+    let gy_pts = -(fy * cp * g_persp);
 
     let half_w = max(sim.canvas_w_pts * 0.5, 1.0);
     let half_h = max(sim.canvas_h_pts * 0.5, 1.0);
 
-    if ((abs(sx_pts) > half_w + 48.0) || (abs(sy_pts) > half_h + 48.0)) {
-        out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    if ((min(abs(sx_pts), abs(gx_pts)) > half_w + 54.0) || (min(abs(sy_pts), abs(gy_pts)) > half_h + 54.0)) {
+        out.clip_pos = vec4<f32>(2.0, 2.0, 0.5, 1.0);
         out.local_uv = vec2<f32>(0.0, 0.0);
         out.color = vec4<f32>(0.0);
         out.taxon = ag.taxon;
         out.wing_phase = 0.0;
+        out.part_kind = 2u;
+        out.depth_fade = 1.0;
         return out;
     }
-
-    let speed = sqrt(max(ag.vel_u_mps * ag.vel_u_mps + ag.vel_v_mps * ag.vel_v_mps, 0.0));
-    var vu = sin(sim.heading_rad);
-    var vv = cos(sim.heading_rad);
-    if (speed > 0.15) {
-        vu = ag.vel_u_mps / speed;
-        vv = ag.vel_v_mps / speed;
-    }
-    let rot_u = vu * cb - vv * sb;
-    let rot_v = (vu * sb + vv * cb) * cp;
-    let fwd_raw = vec2<f32>(rot_u, -rot_v);
-    let fwd_len = max(length(fwd_raw), 1e-4);
-    let fwd_screen = fwd_raw / fwd_len;
-    let right_screen = vec2<f32>(-fwd_screen.y, fwd_screen.x);
 
     let is_roost = (ag.flags & 16u) != 0u;
     let zoom_lvl = log2(max(sim.zoom_scale_px / 256.0, 1.0));
     let quad_diam_pt = clamp(6.8 + max(zoom_lvl - 3.5, 0.0) * 0.72, 6.5, 10.5) * select(1.0, 0.80, is_roost);
     let base_px = quad_diam_pt * 0.56 * clamp(persp, 0.78, 1.25);
+    let uv = quad_corner(corner_idx);
 
-    let uv = quad_corner(vert_idx);
-    let along = uv.y * base_px;
-    let across = uv.x * base_px;
+    let stem_vec = vec2<f32>(sx_pts - gx_pts, sy_pts - gy_pts);
+    let stem_len = length(stem_vec);
+    let show_3d_cues = (sim.cam_pitch_rad > 0.035) && (sim.cam_alt_exag > 0.01) && (stem_len > 3.0);
 
-    let pt_x = sx_pts + right_screen.x * across + fwd_screen.x * along;
-    let pt_y = sy_pts + right_screen.y * across + fwd_screen.y * along;
-
-    let ndc_x = pt_x / half_w;
-    let ndc_y = -pt_y / half_h;
+    if ((part < 2u) && (!show_3d_cues)) {
+        out.clip_pos = vec4<f32>(2.0, 2.0, 0.5, 1.0);
+        out.local_uv = vec2<f32>(0.0, 0.0);
+        out.color = vec4<f32>(0.0);
+        out.taxon = ag.taxon;
+        out.wing_phase = 0.0;
+        out.part_kind = part;
+        out.depth_fade = 1.0;
+        return out;
+    }
 
     var col = vec4<f32>(0.22, 0.74, 0.97, 0.82);
     if (ag.taxon == 0u) {
@@ -231,11 +253,77 @@ fn vs_main(
         col.a = 0.22;
     }
 
-    out.clip_pos = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+    let depth_fade = clamp(1.0 - 0.26 * smoothstep(0.72, 0.99, z_ndc), 0.74, 1.0);
+    let g_depth_fade = clamp(1.0 - 0.35 * smoothstep(0.72, 0.99, g_z_ndc), 0.65, 1.0);
+
+    if (part == 0u) {
+        // Ground shadow ellipse anchored at (gx_pts, gy_pts)
+        let g_ratio = clamp(g_persp / max(persp, 0.1), 0.55, 1.35);
+        let shadow_rx = base_px * 0.55 * g_ratio;
+        let shadow_ry = shadow_rx * clamp(cp, 0.32, 1.0);
+        let pt_x = gx_pts + uv.x * shadow_rx;
+        let pt_y = gy_pts + uv.y * shadow_ry;
+        let shadow_a = select(0.36, 0.15, is_roost) * g_depth_fade;
+        out.clip_pos = vec4<f32>(pt_x / half_w, -pt_y / half_h, g_z_ndc, 1.0);
+        out.local_uv = uv;
+        out.color = vec4<f32>(0.03, 0.06, 0.12, shadow_a);
+        out.taxon = ag.taxon;
+        out.wing_phase = 0.0;
+        out.part_kind = 0u;
+        out.depth_fade = g_depth_fade;
+        return out;
+    }
+
+    if (part == 1u) {
+        // Vertical altitude drop-line stem from ground footprint to airborne silhouette
+        let stem_dir = stem_vec / max(stem_len, 1e-4);
+        let stem_perp = vec2<f32>(-stem_dir.y, stem_dir.x);
+        let t_stem = 0.5 * (uv.y + 1.0);
+        let pt = mix(vec2<f32>(gx_pts, gy_pts), vec2<f32>(sx_pts, sy_pts), t_stem)
+            + stem_perp * (uv.x * 1.15);
+        let z_stem = mix(g_z_ndc, z_ndc, t_stem);
+        let stem_rgb = mix(vec3<f32>(0.58, 0.64, 0.72), col.rgb, 0.32);
+        let stem_a = select(0.18, 0.07, is_roost) * mix(g_depth_fade, depth_fade, t_stem);
+        out.clip_pos = vec4<f32>(pt.x / half_w, -pt.y / half_h, z_stem, 1.0);
+        out.local_uv = uv;
+        out.color = vec4<f32>(stem_rgb, stem_a);
+        out.taxon = ag.taxon;
+        out.wing_phase = 0.0;
+        out.part_kind = 1u;
+        out.depth_fade = depth_fade;
+        return out;
+    }
+
+    let speed = sqrt(max(ag.vel_u_mps * ag.vel_u_mps + ag.vel_v_mps * ag.vel_v_mps, 0.0));
+    var vu = sin(sim.heading_rad);
+    var vv = cos(sim.heading_rad);
+    if (speed > 0.15) {
+        vu = ag.vel_u_mps / speed;
+        vv = ag.vel_v_mps / speed;
+    }
+    let rot_u = vu * cb - vv * sb;
+    let rot_v = (vu * sb + vv * cb) * cp;
+    let fwd_raw = vec2<f32>(rot_u, -rot_v);
+    let fwd_len = max(length(fwd_raw), 1e-4);
+    let fwd_screen = fwd_raw / fwd_len;
+    let right_screen = vec2<f32>(-fwd_screen.y, fwd_screen.x);
+
+    let along = uv.y * base_px;
+    let across = uv.x * base_px;
+
+    let pt_x = sx_pts + right_screen.x * across + fwd_screen.x * along;
+    let pt_y = sy_pts + right_screen.y * across + fwd_screen.y * along;
+
+    let ndc_x = pt_x / half_w;
+    let ndc_y = -pt_y / half_h;
+
+    out.clip_pos = vec4<f32>(ndc_x, ndc_y, z_ndc, 1.0);
     out.local_uv = uv;
     out.color = col;
     out.taxon = ag.taxon;
     out.wing_phase = sin(sim.hour_of_day * 16.0 + f32(inst_idx) * 1.91);
+    out.part_kind = 2u;
+    out.depth_fade = depth_fade;
     return out;
 }
 
@@ -248,6 +336,27 @@ fn sd_capsule_pt(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
 
 @fragment
 fn fs_main(in_frag: VsOut) -> @location(0) vec4<f32> {
+    if (in_frag.part_kind == 0u) {
+        let r2 = dot(in_frag.local_uv, in_frag.local_uv);
+        if (r2 > 1.0) {
+            discard;
+        }
+        let falloff = exp(-2.8 * r2) * (1.0 - smoothstep(0.65, 1.0, r2));
+        let alpha = in_frag.color.a * falloff;
+        return vec4<f32>(in_frag.color.rgb * alpha, alpha);
+    }
+
+    if (in_frag.part_kind == 1u) {
+        let edge = abs(in_frag.local_uv.x);
+        let line_aa = 1.0 - smoothstep(0.32, 0.95, edge);
+        let grad = 0.35 + 0.65 * clamp(0.5 * (in_frag.local_uv.y + 1.0), 0.0, 1.0);
+        let alpha = in_frag.color.a * line_aa * grad;
+        if (alpha <= 0.002) {
+            discard;
+        }
+        return vec4<f32>(in_frag.color.rgb * alpha, alpha);
+    }
+
     let ax = abs(in_frag.local_uv.x);
     let y = in_frag.local_uv.y;
     let p = vec2<f32>(ax, y);
@@ -291,6 +400,6 @@ fn fs_main(in_frag: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
     let aa = 1.0 - smoothstep(-0.04, 0.06, sdf);
-    let alpha = in_frag.color.a * aa;
+    let alpha = in_frag.color.a * aa * in_frag.depth_fade;
     return vec4<f32>(in_frag.color.rgb * alpha, alpha);
 }

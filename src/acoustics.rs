@@ -548,11 +548,16 @@ pub fn synthesize_preset_recording(preset: SynthPreset) -> WavRecording {
 }
 
 /// Computes Hann-windowed STFT power spectrogram (`fft_size` must be a power of two in `256..=4096`),
-/// extracts bioacoustic call pulses (`Fc`, `Fmax`, `Fmin`, duration), computes Pieretti ACI,
+/// extracts bioacoustic call pulses (`Fc`, `Fmax`, `Fmin`, duration), computes Pieretti power-based ACI,
 /// and classifies the vocalization guild.
+///
+/// For long multi-second ultrasonic recordings (`analysis_frames > 900`), the STFT retains overlapping
+/// fine-resolution analysis frames (`hop <= n_fft / 2`) for pulse extraction and Pieretti ACI while
+/// aggregating display columns via per-bin max-hold into `<= 900` columns so short bat pulses (`~2 ms`)
+/// are never skipped in widened-hop blind gaps.
 pub fn compute_stft_spectrogram(rec: &WavRecording, fft_size: usize) -> SpectrogramResult {
     let n_fft = fft_size.next_power_of_two().clamp(256, 4096);
-    let hop = (n_fft / 4).max(64);
+    let base_hop = (n_fft / 4).max(64);
     let num_bins = n_fft / 2;
     let sr = rec.sample_rate_hz.max(1000) as f64;
     let bin_hz = sr / (n_fft as f64);
@@ -563,32 +568,39 @@ pub fn compute_stft_spectrogram(rec: &WavRecording, fft_size: usize) -> Spectrog
     let win_coherent_gain: f64 = hann.iter().sum::<f64>() * 0.5;
 
     let total_samples = rec.samples_mono.len();
-    let num_frames = if total_samples >= n_fft {
-        (total_samples - n_fft) / hop + 1
+    let raw_frames = if total_samples >= n_fft {
+        (total_samples - n_fft) / base_hop + 1
     } else {
         1
     };
 
-    // Cap horizontal frame count to 900 columns by widening hop on multi-second ultrasonic files
-    let effective_hop = if num_frames > 900 {
-        ((total_samples.saturating_sub(n_fft)) / 900).max(hop)
+    // Keep >=50% Hann overlap on ultra-long recordings so short bat echolocation pulses never fall
+    // into inter-window blind gaps, while capping UI spectrogram columns at 900 via max-hold.
+    let analysis_hop = if raw_frames > 24_000 {
+        (n_fft / 2).max(base_hop)
     } else {
-        hop
+        base_hop
     };
-    let frames = if total_samples >= n_fft {
-        (total_samples - n_fft) / effective_hop + 1
+    let analysis_frames = if total_samples >= n_fft {
+        (total_samples - n_fft) / analysis_hop + 1
     } else {
         1
     };
+    let display_frames = analysis_frames.min(900);
 
-    let mut power_dbfs = vec![-100.0_f32; frames * num_bins];
-    let mut lin_mag = vec![0.0_f64; frames * num_bins];
+    let mut power_dbfs = vec![-105.0_f32; display_frames * num_bins];
+    let mut prev_pow = vec![0.0_f64; num_bins];
+    let mut diff_sum_per_bin = vec![0.0_f64; num_bins];
+    let mut int_sum_per_bin = vec![0.0_f64; num_bins];
+    let mut fine_peak_db = vec![-120.0_f32; analysis_frames];
+    let mut fine_peak_bin = vec![0_usize; analysis_frames];
+
     let mut re = vec![0.0_f64; n_fft];
     let mut im = vec![0.0_f64; n_fft];
 
     let mut global_peak_db = -120.0_f32;
-    for f_idx in 0..frames {
-        let start = f_idx * effective_hop;
+    for f_idx in 0..analysis_frames {
+        let start = f_idx * analysis_hop;
         re.fill(0.0);
         im.fill(0.0);
         for k in 0..n_fft {
@@ -598,66 +610,97 @@ pub fn compute_stft_spectrogram(rec: &WavRecording, fft_size: usize) -> Spectrog
         }
         fft_radix2_inplace(&mut re, &mut im);
 
+        let disp_col = if analysis_frames > display_frames {
+            ((f_idx * display_frames) / analysis_frames).min(display_frames - 1)
+        } else {
+            f_idx
+        };
+
+        let mut frame_best_db = -120.0_f32;
+        let mut frame_best_bin = 0_usize;
+
         for b in 1..num_bins {
             let mag = (re[b] * re[b] + im[b] * im[b]).sqrt() / win_coherent_gain.max(1.0);
-            lin_mag[f_idx * num_bins + b] = mag;
-            let db = (20.0 * (mag + 1e-9).log10()).clamp(-105.0, 0.0) as f32;
-            power_dbfs[f_idx * num_bins + b] = db;
+            let pow = mag * mag;
+            let db = (10.0 * (pow + 1e-18).log10()).clamp(-105.0, 0.0) as f32;
+            let cell = &mut power_dbfs[disp_col * num_bins + b];
+            if db > *cell {
+                *cell = db;
+            }
             if db > global_peak_db {
                 global_peak_db = db;
             }
+            if b >= 2 {
+                if db > frame_best_db {
+                    frame_best_db = db;
+                    frame_best_bin = b;
+                }
+                int_sum_per_bin[b] += pow;
+                if f_idx > 0 {
+                    diff_sum_per_bin[b] += (pow - prev_pow[b]).abs();
+                }
+                prev_pow[b] = pow;
+            }
         }
-        power_dbfs[f_idx * num_bins] = power_dbfs[f_idx * num_bins + 1];
+
+        fine_peak_db[f_idx] = frame_best_db;
+        fine_peak_bin[f_idx] = frame_best_bin;
     }
 
-    // Pieretti Acoustic Complexity Index (ACI): sum(|I_t - I_{t+1}|) / sum(I_t) across bins
+    for col in 0..display_frames {
+        power_dbfs[col * num_bins] = power_dbfs[col * num_bins + 1];
+    }
+
+    // Pieretti Acoustic Complexity Index (ACI): sum(|I_t - I_{t+1}|) / sum(I_t) using power I = mag^2
+    // across all frames including the final frame (0..analysis_frames).
     let mut aci_total = 0.0_f64;
-    if frames >= 2 {
+    if analysis_frames >= 2 {
         for b in 2..num_bins {
-            let mut diff_sum = 0.0;
-            let mut int_sum = 0.0;
-            for f_idx in 0..(frames - 1) {
-                let a0 = lin_mag[f_idx * num_bins + b];
-                let a1 = lin_mag[(f_idx + 1) * num_bins + b];
-                diff_sum += (a0 - a1).abs();
-                int_sum += a0;
-            }
-            if int_sum > 1e-9 {
-                aci_total += diff_sum / int_sum;
+            let int_sum = int_sum_per_bin[b];
+            if int_sum > 1e-12 {
+                aci_total += diff_sum_per_bin[b] / int_sum;
             }
         }
     }
 
     // Extract active spectral ridge & discrete vocalization pulses (within 24 dB of peak & >= -58 dBFS)
     let gate_db = (global_peak_db - 24.0).max(-58.0);
-    let mut ridge_khz = vec![None; frames];
-    for f_idx in 0..frames {
+    let mut fine_ridge_khz = vec![None; analysis_frames];
+    for f_idx in 0..analysis_frames {
+        if fine_peak_db[f_idx] > gate_db && fine_peak_bin[f_idx] >= 2 {
+            fine_ridge_khz[f_idx] =
+                Some(((fine_peak_bin[f_idx] as f64 * bin_hz) / 1000.0) as f32);
+        }
+    }
+
+    let mut ridge_khz = vec![None; display_frames];
+    for col in 0..display_frames {
         let mut best_db = gate_db;
         let mut best_bin = None;
         for b in 2..num_bins {
-            let db = power_dbfs[f_idx * num_bins + b];
+            let db = power_dbfs[col * num_bins + b];
             if db > best_db {
                 best_db = db;
                 best_bin = Some(b);
             }
         }
         if let Some(b) = best_bin {
-            ridge_khz[f_idx] = Some(((b as f64 * bin_hz) / 1000.0) as f32);
+            ridge_khz[col] = Some(((b as f64 * bin_hz) / 1000.0) as f32);
         }
     }
 
-    let frame_dt_ms = (effective_hop as f64 * 1000.0) / sr;
+    let frame_dt_ms = (analysis_hop as f64 * 1000.0) / sr;
     let rec_dur_ms = rec.duration_ms();
     let mut pulses = Vec::new();
     let mut idx = 0usize;
-    while idx < frames {
-        if ridge_khz[idx].is_some() {
+    while idx < analysis_frames {
+        if fine_ridge_khz[idx].is_some() {
             let p_start = idx;
-            while idx < frames && ridge_khz[idx].is_some() {
+            while idx < analysis_frames && fine_ridge_khz[idx].is_some() {
                 idx += 1;
             }
             let p_end = idx;
-            let slice_freqs: Vec<f64> = ridge_khz[p_start..p_end]
+            let slice_freqs: Vec<f64> = fine_ridge_khz[p_start..p_end]
                 .iter()
                 .filter_map(|x| x.map(|v| v as f64))
                 .collect();
@@ -670,10 +713,8 @@ pub fn compute_stft_spectrogram(rec: &WavRecording, fft_size: usize) -> Spectrog
                 let f_char = tail.iter().sum::<f64>() / (tail.len().max(1) as f64);
 
                 let mut pk_db = -100.0_f64;
-                for f_i in p_start..p_end {
-                    for b in 2..num_bins {
-                        pk_db = pk_db.max(power_dbfs[f_i * num_bins + b] as f64);
-                    }
+                for &db in &fine_peak_db[p_start..p_end] {
+                    pk_db = pk_db.max(db as f64);
                 }
                 let start_ms = (p_start as f64 * frame_dt_ms).min(rec_dur_ms);
                 let max_dur_ms = (rec_dur_ms - start_ms).max(0.0);
@@ -709,10 +750,10 @@ pub fn compute_stft_spectrogram(rec: &WavRecording, fft_size: usize) -> Spectrog
     let (classified_taxon, guild_label, scientific_hint) = classify_bioacoustic_guild(fc, fmax, fmin, mean_dur);
 
     SpectrogramResult {
-        num_frames: frames,
+        num_frames: display_frames,
         num_bins,
         fft_size: n_fft,
-        hop_size: effective_hop,
+        hop_size: analysis_hop,
         sample_rate_hz: rec.sample_rate_hz,
         duration_ms: rec.duration_ms(),
         max_freq_khz: rec.nyquist_khz(),

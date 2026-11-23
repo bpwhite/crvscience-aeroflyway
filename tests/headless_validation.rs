@@ -28,15 +28,17 @@ use aeroflyway::db::{
     ObservationRecord,
 };
 use aeroflyway::export::{export_corridor_csv_bundle, export_corridor_geojson};
+use aeroflyway::gpu_pipeline::{pack_gpu_scene_buffers, pack_gpu_uniforms, GpuSimUniforms};
 use aeroflyway::ingest::{
     build_regional_radar_profiles, parse_vpts_csv_text, summarize_profile_mtr_and_peak,
-    Cmip6Scenario,
+    Cmip6Scenario, RadarAltitudeBin,
 };
 use aeroflyway::map_engine::{MapLabelPlacer, MapViewport};
 use aeroflyway::physics::{
     compute_gpu_scale_factor, compute_lights_out_collision_reduction_pct,
-    default_synoptic_nodes_for_region, effective_skyglow_radiance_nw, AeroPhysicsEngine,
-    SeasonPreset, SimulationParams, CPU_SWARM_AGENT_COUNT,
+    compute_skyglow_curfew_dim, default_synoptic_nodes_for_region, effective_skyglow_radiance_nw,
+    turbine_box_half_lon_deg, turbine_collision_step_prob, AeroPhysicsEngine,
+    BAT_TURBINE_COLLISION_RATE_PER_HR, CPU_SWARM_AGENT_COUNT, SeasonPreset, SimulationParams,
 };
 use eframe::egui::{Pos2, Rect, Vec2};
 use serde_json::{json, Map, Value};
@@ -1052,4 +1054,304 @@ fn t7_low_sample_rate_spectrogram_and_pulse_bounds_regression() {
             long_rec.duration_ms()
         );
     }
+}
+
+#[test]
+fn t8_vpts_variable_bin_height_mtr_scaling() {
+    // Same bird density (20 birds/km^3) and speed (10 m/s = 36 km/h) across 4 gates at 100 m vs 500 m spacing
+    let mk_bins = |step_m: f64| -> Vec<RadarAltitudeBin> {
+        (1..=4)
+            .map(|k| RadarAltitudeBin {
+                height_m_asl: (k as f64) * step_m,
+                bird_density_per_km3: 20.0,
+                u_mps: 6.0,
+                v_mps: 8.0,
+                reflectivity_eta: 220.0,
+                sd_vvp_mps: 3.1,
+            })
+            .collect()
+    };
+
+    let (mtr_100, peak_100) = summarize_profile_mtr_and_peak(&mk_bins(100.0));
+    let (mtr_500, peak_500) = summarize_profile_mtr_and_peak(&mk_bins(500.0));
+
+    // 4 bins * 20 birds/km^3 * 36 km/h * 0.1 km = 288.0; at 0.5 km = 1440.0 (exact 5.0x ratio)
+    assert!((mtr_100 - 288.0).abs() < 1e-9, "Expected 288.0 MTR at 100m, got {mtr_100}");
+    assert!((mtr_500 - 1440.0).abs() < 1e-9, "Expected 1440.0 MTR at 500m, got {mtr_500}");
+    assert!(((mtr_500 / mtr_100) - 5.0).abs() < 1e-9);
+    assert!((peak_100 - 100.0).abs() < 1e-9);
+    assert!((peak_500 - 500.0).abs() < 1e-9);
+
+    // Unsorted bins produce identical integrated MTR
+    let mut reversed = mk_bins(100.0);
+    reversed.reverse();
+    let (mtr_rev, _) = summarize_profile_mtr_and_peak(&reversed);
+    assert!((mtr_rev - mtr_100).abs() < 1e-9);
+
+    // Non-uniform gates [100, 200, 400, 800] m: widths = [100, 150, 300, 400] m => total 0.95 km => 684.0
+    let nonuniform: Vec<RadarAltitudeBin> = [100.0, 200.0, 400.0, 800.0]
+        .iter()
+        .map(|&h| RadarAltitudeBin {
+            height_m_asl: h,
+            bird_density_per_km3: 20.0,
+            u_mps: 6.0,
+            v_mps: 8.0,
+            reflectivity_eta: 220.0,
+            sd_vvp_mps: 3.0,
+        })
+        .collect();
+    let (mtr_nonuni, _) = summarize_profile_mtr_and_peak(&nonuniform);
+    assert!(
+        (mtr_nonuni - 20.0 * 36.0 * 0.95).abs() < 1e-9,
+        "Expected 684.0 MTR for nonuniform gates, got {mtr_nonuni}"
+    );
+
+    // VPTS CSV parser preserves 100m and 500m gates without snapping to 200m
+    let station = &radar_stations_for_region(FlywayRegion::EastAtlanticPalearctic)[0];
+    let csv_100 = "\
+radar,datetime,height,dens,u,v,sd_vvp
+nlhrw,2026-10-04T02:00Z,100,20.0,6.0,8.0,2.5
+nlhrw,2026-10-04T02:00Z,200,20.0,6.0,8.0,2.5
+nlhrw,2026-10-04T02:00Z,300,20.0,6.0,8.0,2.5
+nlhrw,2026-10-04T02:00Z,400,20.0,6.0,8.0,2.5
+";
+    let csv_500 = "\
+radar,datetime,height,dens,u,v,sd_vvp
+nlhrw,2026-10-04T02:00Z,500,20.0,6.0,8.0,2.5
+nlhrw,2026-10-04T02:00Z,1000,20.0,6.0,8.0,2.5
+nlhrw,2026-10-04T02:00Z,1500,20.0,6.0,8.0,2.5
+nlhrw,2026-10-04T02:00Z,2000,20.0,6.0,8.0,2.5
+";
+    let p100 = parse_vpts_csv_text(csv_100, station).expect("parse 100m VPTS CSV");
+    let p500 = parse_vpts_csv_text(csv_500, station).expect("parse 500m VPTS CSV");
+    assert_eq!(p100.bins.len(), 4);
+    assert_eq!(p500.bins.len(), 4);
+    assert!((p100.mtr_birds_km_hr - 288.0).abs() < 1e-6);
+    assert!((p500.mtr_birds_km_hr - 1440.0).abs() < 1e-6);
+}
+
+#[test]
+fn t9_skyglow_curfew_parity_dusk_vs_curfew_and_uniform_layout() {
+    // 1. Check GpuSimUniforms exact 16-byte multiple (48 scalars = 192 bytes)
+    assert_eq!(std::mem::size_of::<GpuSimUniforms>(), 192);
+    assert_eq!(std::mem::size_of::<GpuSimUniforms>() % 16, 0);
+
+    let region = FlywayRegion::AtlanticAmericas;
+    let mut params = SimulationParams::default();
+    params.region = region;
+    params.lights_out_curfew_pct = 80.0;
+    params.skyglow_intensity_mult = 1.25;
+
+    let wx = default_synoptic_nodes_for_region(region, params.cmip6_scenario);
+    let turbines = seed_wind_turbines_for_region(region);
+    let patches = seed_milkweed_patches_for_region(region);
+    let domes = skyglow_domes_for_region(region);
+
+    // 2. Dusk (21:00) uses 0.32 dimming factor vs Curfew (01:00) using 0.88 factor
+    for (hour_of_day, expected_factor) in [(21.0_f64, 0.32_f64), (1.0_f64, 0.88_f64)] {
+        let expected_dim = 1.0 - expected_factor * 0.80;
+        let cpu_dim = compute_skyglow_curfew_dim(hour_of_day, true, params.lights_out_curfew_pct);
+        assert!(
+            (cpu_dim - expected_dim).abs() < 1e-12,
+            "Hour {hour_of_day}: expected dim {expected_dim}, got {cpu_dim}"
+        );
+
+        let uniforms = pack_gpu_uniforms(
+            39.0,
+            -75.0,
+            6.0,
+            42.0,
+            -18.0,
+            1.0,
+            1200.0,
+            700.0,
+            900.0,
+            200.0,
+            0.25,
+            hour_of_day,
+            268.0,
+            12.0,
+            0.1,
+            900.0,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            2560,
+            1,
+            1.0,
+            &params,
+            wx.len(),
+            turbines.len(),
+            16,
+        );
+        assert!(
+            (uniforms.curfew_dim as f64 - expected_dim).abs() < 1e-6,
+            "GPU uniform curfew_dim mismatch at hour {hour_of_day}"
+        );
+        assert!((uniforms.transect_aspect - 4.5).abs() < 1e-6);
+
+        let (_, _, gpu_att) = pack_gpu_scene_buffers(
+            region,
+            0.1,
+            hour_of_day,
+            true,
+            params.lights_out_curfew_pct,
+            params.skyglow_intensity_mult,
+            &wx,
+            &turbines,
+            &patches,
+        );
+        let gpu_domes: Vec<_> = gpu_att.iter().filter(|a| a.kind == 2).collect();
+        assert_eq!(gpu_domes.len(), domes.len());
+
+        for (dome, gpu_d) in domes.iter().zip(gpu_domes.iter()) {
+            let cpu_eff = effective_skyglow_radiance_nw(
+                dome.peak_radiance_nw_cm2_sr,
+                hour_of_day,
+                true,
+                params.lights_out_curfew_pct,
+                params.skyglow_intensity_mult,
+            );
+            assert!(
+                (gpu_d.weight as f64 - cpu_eff).abs() < 1e-4,
+                "Scene buffer radiance mismatch for {} at hour {hour_of_day}",
+                dome.city_name
+            );
+            // compute.wgsl reconstructs unmitigated glow via best_glow / sim.curfew_dim
+            let reconstructed_unmit = (gpu_d.weight / uniforms.curfew_dim) as f64;
+            let expected_unmit = dome.peak_radiance_nw_cm2_sr * params.skyglow_intensity_mult;
+            assert!(
+                (reconstructed_unmit - expected_unmit).abs() < 1e-3,
+                "GPU unmitigated glow reconstruction failed at hour {hour_of_day}: {reconstructed_unmit} vs {expected_unmit}"
+            );
+        }
+    }
+
+    // 3. Verify Poisson collision rate sub-stepping invariance and cos(lat) metric box scaling
+    let p_1hr = turbine_collision_step_prob(BAT_TURBINE_COLLISION_RATE_PER_HR, 1.0);
+    let p_sub = turbine_collision_step_prob(BAT_TURBINE_COLLISION_RATE_PER_HR, 0.1);
+    let p_10sub = 1.0 - (1.0 - p_sub).powi(10);
+    assert!((p_1hr - p_10sub).abs() < 1e-12);
+
+    let lon_45 = turbine_box_half_lon_deg(0.032, 45.0);
+    assert!((lon_45 - (0.032 / 45.0_f64.to_radians().cos())).abs() < 1e-12);
+}
+
+#[test]
+fn t10_pieretti_power_aci_and_short_bat_pulse_retention() {
+    // 1. Pieretti power-based ACI includes the final frame so ACI_b <= 2.0 per active bin
+    let sr = 48_000_u32;
+    let n_samples = 2048usize; // fft=1024, hop=256 => 5 frames (0..5)
+    let mut pulse_end = vec![0.0_f32; n_samples];
+    // Pure tone present only in the trailing segment (final frame)
+    for (i, s) in pulse_end.iter_mut().enumerate().skip(1536) {
+        let t = i as f64 / sr as f64;
+        *s = (0.75 * (2.0 * std::f64::consts::PI * 6_000.0 * t).sin()) as f32;
+    }
+    let rec_end = WavRecording {
+        source_label: "end_frame_pulse.wav".to_string(),
+        sample_rate_hz: sr,
+        channels: 1,
+        bits_per_sample: 16,
+        samples_mono: pulse_end,
+        guano_lat_lon: None,
+    };
+    let spec_end = compute_stft_spectrogram(&rec_end, 1024);
+    assert_eq!(spec_end.num_frames, 5);
+    assert!(spec_end.aci_index > 0.0);
+    // Max theoretical ACI across (num_bins - 2 = 510) bins is <= 2.0 * 510 (and < 1020)
+    assert!(
+        spec_end.aci_index <= 2.0 * ((spec_end.num_bins - 2) as f64) + 1e-9,
+        "ACI exceeded Pieretti bound: {}",
+        spec_end.aci_index
+    );
+
+    // Steady continuous sine tone has much lower per-bin ACI than a pulsed modulated signal
+    let steady_samples: Vec<f32> = (0..24_000)
+        .map(|i| (0.65 * (2.0 * std::f64::consts::PI * 6_000.0 * (i as f64 / sr as f64)).sin()) as f32)
+        .collect();
+    let pulsed_samples: Vec<f32> = (0..24_000)
+        .map(|i| {
+            let t = i as f64 / sr as f64;
+            let gate = if (i / 1200) % 2 == 0 { 1.0 } else { 0.05 };
+            (0.65 * gate * (2.0 * std::f64::consts::PI * 6_000.0 * t).sin()) as f32
+        })
+        .collect();
+    let spec_steady = compute_stft_spectrogram(
+        &WavRecording {
+            source_label: "steady.wav".to_string(),
+            sample_rate_hz: sr,
+            channels: 1,
+            bits_per_sample: 16,
+            samples_mono: steady_samples,
+            guano_lat_lon: None,
+        },
+        1024,
+    );
+    let spec_pulsed = compute_stft_spectrogram(
+        &WavRecording {
+            source_label: "pulsed.wav".to_string(),
+            sample_rate_hz: sr,
+            channels: 1,
+            bits_per_sample: 16,
+            samples_mono: pulsed_samples,
+            guano_lat_lon: None,
+        },
+        1024,
+    );
+    assert!(
+        spec_pulsed.aci_index > spec_steady.aci_index * 2.0,
+        "Pulsed signal ACI ({:.2}) should substantially exceed steady tone ACI ({:.2})",
+        spec_pulsed.aci_index,
+        spec_steady.aci_index
+    );
+
+    // 2. Short 2.4 ms bat echolocation pulses inside a 6.0 s (250 kHz) recording must NOT be dropped
+    let sr_bat = 250_000_u32;
+    let total_bat = sr_bat as usize * 6;
+    let mut bat_samples = vec![0.0_f32; total_bat];
+    let pulse_windows = [(1.203_f64, 0.0024_f64), (4.417_f64, 0.0024_f64)];
+    for &(p_start_s, p_dur_s) in &pulse_windows {
+        let i0 = (p_start_s * sr_bat as f64) as usize;
+        let i1 = ((p_start_s + p_dur_s) * sr_bat as f64) as usize;
+        for (i, s) in bat_samples[i0..i1.min(total_bat)].iter_mut().enumerate() {
+            let dt = i as f64 / sr_bat as f64;
+            let u = dt / p_dur_s;
+            let f0 = 78_000.0;
+            let f1 = 42_000.0;
+            let phase = 2.0 * std::f64::consts::PI * (f0 * dt + 0.5 * ((f1 - f0) / p_dur_s) * dt * dt);
+            let env = (std::f64::consts::PI * u).sin().powf(0.5);
+            *s = (0.78 * env * phase.sin()) as f32;
+        }
+    }
+    let long_bat_rec = WavRecording {
+        source_label: "short_bat_in_6s.wav".to_string(),
+        sample_rate_hz: sr_bat,
+        channels: 1,
+        bits_per_sample: 16,
+        samples_mono: bat_samples,
+        guano_lat_lon: Some((45.638, -120.605)),
+    };
+    let long_bat_spec = compute_stft_spectrogram(&long_bat_rec, 1024);
+    assert_eq!(long_bat_spec.num_frames, 900);
+    assert_eq!(
+        long_bat_spec.pulses.len(),
+        2,
+        "Expected both 2.4 ms Myotis pulses to be preserved in 6.0 s recording (found {})",
+        long_bat_spec.pulses.len()
+    );
+    assert_eq!(long_bat_spec.classified_taxon, Taxon::Bat);
+    assert!(long_bat_spec.characteristic_freq_khz >= 35.0);
+    let max_disp_db = long_bat_spec
+        .power_dbfs
+        .iter()
+        .copied()
+        .fold(-120.0_f32, f32::max);
+    assert!(
+        max_disp_db > -25.0,
+        "Max-hold display spectrogram must retain short bat pulse energy (max={max_disp_db:.1} dBFS)"
+    );
 }
