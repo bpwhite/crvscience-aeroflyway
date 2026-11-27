@@ -13,6 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
 
+#![forbid(unsafe_code)]
+
 pub mod acoustics;
 pub mod basemap;
 pub mod cli;
@@ -22,3 +24,9 @@ pub mod gpu_pipeline;
 pub mod ingest;
 pub mod map_engine;
 pub mod physics;
+
+pub use export::{
+    evaluate_multi_corridor_lights_out_summary, export_multi_corridor_lights_out_summary,
+    format_multi_corridor_lights_out_csv, CorridorLightsOutInterventionRow,
+    MultiCorridorLightsOutSummary,
+};

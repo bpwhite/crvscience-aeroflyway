@@ -2,7 +2,7 @@
 
 ![AeroFlyway Headless Workbench](validation/headless_screenshot.png)
 
-Pure-Rust desktop aeroecology GIS, `wgpu`/WGSL 100,000-agent multi-flyway simulator, **Startup Campaign Hub**, **VIIRS nighttime skyglow `Lights-Out` urban collision model**, **NEXRAD WSR-88D / ENRAM Aloft vertical radar profile (`VPTS`) analyzer**, continuous 365-day phenology engine, and WAV/GUANO bioacoustic STFT workbench.
+Pure-Rust desktop aeroecology GIS (`#![forbid(unsafe_code)]` library core, `#![deny(unsafe_code)]` binary with strictly scoped Windows `AttachConsole` FFI), `wgpu`/WGSL 100,000-agent multi-flyway simulator, **Startup Campaign Hub**, **VIIRS nighttime skyglow `Lights-Out` urban collision model**, **NEXRAD WSR-88D / ENRAM Aloft vertical radar profile (`VPTS`) analyzer**, continuous 365-day phenology engine, and WAV/GUANO bioacoustic STFT workbench.
 
 - **User Guide**: [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)
 - **Scientific Methods & Equations**: [`docs/SCIENTIFIC_METHODS.md`](docs/SCIENTIFIC_METHODS.md)
@@ -37,8 +37,9 @@ All single-key shortcuts automatically ignore input while typing in any text fie
 | `T` | Toggle `Draw A-B Transect` map tool <-> `Pan & Inspect` |
 | `M` | Toggle `Plant Virtual Milkweed Host Patch` map tool <-> `Pan & Inspect` |
 | `L` | Toggle `85%` BirdCast Lights-Out curfew vs `0%` unmitigated (prints status feedback) |
+| `Ctrl+K` | Open fuzzy command palette (`Up`/`Down`/`Enter`/`Esc`) for views, corridors, simulation & exports |
 | `Ctrl+S` | Save active campaign metadata to SQLite `.db` |
-| `Esc` | Dismiss About/Help modal, or reset map tool to `Pan & Inspect` |
+| `Esc` | Dismiss palette or About/Help modal, or reset map tool to `Pan & Inspect` |
 | `F1` | Show / hide Shortcuts & Scientific Grounding reference modal |
 | Primary-drag / Click | Pan map (`Pan / Inspect`), drag A->B line (`Draw Transect`), or plant patch (`Plant Host Patch`) |
 | Secondary-drag | Orbit bearing (`-180°..+180°`) and tilt camera pitch (`0°..62°`) |
@@ -76,6 +77,9 @@ cargo run --release -- batch --region atlantic --ssp ssp245 --doy 268 --hours 72
 cargo run --release -- inspect-wav sample_calls/ --fft 1024 --export-pngs --pin-db \
   --default-lat 44.4128 --default-lon -123.3285 --db aeroflyway.db --out-dir exports
 
+# Compare migration mortality & BirdCast Lights-Out curfews across all 5 global corridors (JSON + CSV)
+cargo run --release -- compare-corridors --doy 272 --hours 24 --lights-out 85 --out-dir exports
+
 # Headless live public API sync (Open-Meteo, CMIP6, CAMS, Radar S3, GLO-90 DEM, iNat, GBIF, USWTDB, eBird)
 cargo run --release -- sync --region pacific --ssp ssp245 --warmup-hours 12 \
   --db aeroflyway.db --export-dir exports
@@ -83,7 +87,7 @@ cargo run --release -- sync --region pacific --ssp ssp245 --warmup-hours 12 \
 
 ## Validation Suite & Empirical Metrics
 
-Run the full unit and headless integration validation suite (`14` tests across `src/lib.rs`, `src/main.rs`, and `tests/headless_validation.rs`):
+Run the full unit and headless integration validation suite (`23` tests across `src/lib.rs`, `src/main.rs`, and `tests/headless_validation.rs`):
 
 ```bash
 cargo test --all-targets

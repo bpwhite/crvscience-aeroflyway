@@ -124,8 +124,9 @@ Press `3` to open **`[3] WAV STFT Bioacoustic Inspector`**:
 | `T` | Global (non-text) | Toggle `Draw A-B Transect` tool mode |
 | `M` | Global (non-text) | Toggle `Plant Virtual Milkweed Host Patch` tool mode |
 | `L` | Global (non-text) | Toggle 85% BirdCast Lights-Out curfew vs 0% unmitigated |
+| `Ctrl+K` / `Cmd+K` | Global (non-text) | Open fuzzy command palette (`Up`/`Down`/`Enter`/`Esc`) for views, corridors, simulation, and exports |
 | `Ctrl+S` / `Cmd+S` | Global | Save campaign metadata into active SQLite `.db` |
-| `Esc` | Global | Close About/Help modal or reset tool mode to `Pan / Inspect` |
+| `Esc` | Global | Close palette or About/Help modal, or reset tool mode to `Pan / Inspect` |
 | `F1` | Global (non-text) | Toggle Shortcuts & Scientific Grounding help modal |
 
 ### CLI Subcommands & Flags
@@ -137,3 +138,4 @@ Press `3` to open **`[3] WAV STFT Bioacoustic Inspector`**:
 - `aeroflyway batch [--region <code>] [--doy <f64>] [--season <spring|summer|autumn|overwinter>] [--ssp <baseline|ssp126|ssp245|ssp370|ssp585>] [--lights-out <csv>] [--smoke-pm25 <csv>] [--hours <f64>] [--cut-in <csv>] [--milkweed-add <csv>] [--temp-offset <csv>] [--wind-mult <f64>] [--precip <f64>] [--db <path>] [--out-dir <dir>] [--export-best-geojson]`: Run parallel parameter sweep and write CSV/JSON/GeoJSON reports.
 - `aeroflyway inspect-wav <path> [--fft <usize>] [--pin-db] [--export-pngs] [--default-lat <f64>] [--default-lon <f64>] [--db <path>] [--out-dir <dir>]`: Batch STFT analysis across `.wav` files/folders.
 - `aeroflyway sync [--region <code>] [--ssp <code>] [--lat <f64>] [--lon <f64>] [--ebird-key <token>] [--warmup-hours <f64>] [--db <path>] [--export-dir <dir>]`: Headless live API + Radar S3 + GLO-90 sync and optional snapshot export.
+- `aeroflyway compare-corridors [--doy <f64>] [--hours <f64>] [--lights-out <f64>] [--out-dir <dir>]`: Compare `0%` unmitigated vs. Lights-Out curfew urban strike & bat rotor mortality across all 5 global flyways (`aeroflyway_multi_corridor_lights_out.json` & `.csv`).

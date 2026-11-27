@@ -30,7 +30,9 @@ use crate::basemap::{
     WindTurbine,
 };
 use crate::db::{baseline_observations_for_region, spatial_hex_bin, FlywayStore, ObservationRecord};
-use crate::export::{export_corridor_geojson, export_corridor_csv_bundle};
+use crate::export::{
+    export_corridor_csv_bundle, export_corridor_geojson, export_multi_corridor_lights_out_summary,
+};
 use crate::ingest::{
     build_regional_radar_profiles, load_vpts_csv_file, run_blocking_ingest, Cmip6Scenario,
     SynopticNodeWeather,
@@ -196,6 +198,10 @@ pub fn try_dispatch_cli() -> Result<CliDispatchOutcome, String> {
             run_cli_sync(&args[1..])?;
             Ok(CliDispatchOutcome::HandledExit)
         }
+        "compare-corridors" => {
+            run_cli_compare_corridors(&args[1..])?;
+            Ok(CliDispatchOutcome::HandledExit)
+        }
         other => Err(format!(
             "Unknown subcommand '{other}'. Run `aeroflyway --help` for usage."
         )),
@@ -243,6 +249,7 @@ USAGE:
   aeroflyway batch [OPTIONS]                 Run Rayon-parallel multi-scenario parameter sweeps
   aeroflyway inspect-wav <PATH> [OPTIONS]    Batch-process a .wav file or recursive folder via STFT
   aeroflyway sync [OPTIONS]                  Headless sync of Open-Meteo, CMIP6, Radar S3, GLO-90 & biodiversity
+  aeroflyway compare-corridors [OPTIONS]     Compare migration mortality & Lights-Out curfews across all 5 corridors
 
 RADAR OPTIONS (`aeroflyway radar`):
   --region <code>            pacific | central | atlantic | palearctic | east_asia [default: pacific]
@@ -285,6 +292,12 @@ SYNC OPTIONS (`aeroflyway sync`):
   --warmup-hours <f64>       EnKF assimilation spin-up hours before export [default: 12.0]
   --db <path>                SQLite WAL database path [default: aeroflyway.db]
   --export-dir <dir>         Optional folder to immediately write fresh GeoJSON & CSV snapshots
+
+COMPARE-CORRIDORS OPTIONS (`aeroflyway compare-corridors`):
+  --doy <f64>                Day of Year (1..365) [default: 272.0]
+  --hours <f64>              Simulated duration per corridor in hours [default: 24.0]
+  --lights-out <f64>         Lights-Out curfew dimming % [default: 85.0]
+  --out-dir <dir>            Output folder for JSON & CSV summary [default: exports]
 "
     );
 }
@@ -1257,4 +1270,96 @@ fn parse_csv_list<T: std::str::FromStr>(
         return Err(format!("{flag} list cannot be empty"));
     }
     Ok(out)
+}
+
+pub fn run_cli_compare_corridors(args: &[String]) -> Result<(), String> {
+    let mut doy = 272.0_f64;
+    let mut hours = 24.0_f64;
+    let mut lights_out = 85.0_f64;
+    let mut out_dir = PathBuf::from("exports");
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--doy" => {
+                i += 1;
+                doy = parse_arg_val::<f64>(args.get(i), "--doy")?.clamp(1.0, 365.0);
+            }
+            "--hours" => {
+                i += 1;
+                hours = parse_arg_val::<f64>(args.get(i), "--hours")?.clamp(1.0, 240.0);
+            }
+            "--lights-out" => {
+                i += 1;
+                lights_out = parse_arg_val::<f64>(args.get(i), "--lights-out")?.clamp(0.0, 100.0);
+            }
+            "--out-dir" => {
+                i += 1;
+                out_dir = PathBuf::from(args.get(i).ok_or("Missing value for --out-dir")?);
+            }
+            "-h" | "--help" => {
+                print_cli_help();
+                return Ok(());
+            }
+            flag => return Err(format!("Unrecognized `compare-corridors` flag '{flag}'")),
+        }
+        i += 1;
+    }
+
+    let (json_path, csv_path, summary) =
+        export_multi_corridor_lights_out_summary(&out_dir, hours, doy, lights_out)?;
+    println!(
+        "[AeroFlyway v0.6 Compare] {} corridors | DOY {:.0} | {:.1}h | Lights-Out {:.0}% | Urban strikes {} -> {} (-{:.1}%) | Bat contacts {} -> {} (-{:.1}%)",
+        summary.corridor_count,
+        summary.doy,
+        summary.sim_hours,
+        summary.lights_out_curfew_pct,
+        summary.total_baseline_urban_strikes,
+        summary.total_intervened_urban_strikes,
+        summary.aggregate_avoided_urban_strikes_pct,
+        summary.total_baseline_bat_contacts,
+        summary.total_intervened_bat_contacts,
+        summary.aggregate_avoided_bat_contacts_pct,
+    );
+    println!(
+        "  Wrote JSON -> {} and CSV -> {}",
+        json_path.display(),
+        csv_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_compare_corridors_writes_five_corridor_summary_files() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aeroflyway_cli_compare_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let args = vec![
+            "--doy".to_string(),
+            "272".to_string(),
+            "--hours".to_string(),
+            "6".to_string(),
+            "--lights-out".to_string(),
+            "85".to_string(),
+            "--out-dir".to_string(),
+            tmp_dir.display().to_string(),
+        ];
+        run_cli_compare_corridors(&args).expect("compare-corridors CLI executes cleanly");
+        assert!(tmp_dir.join("aeroflyway_multi_corridor_lights_out.json").exists());
+        assert!(tmp_dir.join("aeroflyway_multi_corridor_lights_out.csv").exists());
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn cli_compare_corridors_rejects_unknown_flag() {
+        let err = run_cli_compare_corridors(&["--unknown-flag".to_string()])
+            .expect_err("unknown flag must fail");
+        assert!(err.contains("Unrecognized `compare-corridors` flag"));
+    }
 }

@@ -19,11 +19,17 @@
 //! wind-turbine rotor envelopes, host-plant patches, sightings, and agent streamlines.
 
 use crate::basemap::{
-    sample_terrain_elevation_m, skyglow_domes_for_region, MilkweedPatch, Taxon, WindTurbine,
+    sample_terrain_elevation_m, seed_milkweed_patches_for_region, seed_wind_turbines_for_region,
+    skyglow_domes_for_region, FlywayRegion, MilkweedPatch, Taxon, WindTurbine,
 };
-use crate::db::{hex_bin_center, spatial_hex_bin, ObservationRecord};
+use crate::db::{baseline_observations_for_region, hex_bin_center, spatial_hex_bin, ObservationRecord};
+use crate::ingest::Cmip6Scenario;
 use crate::map_engine::haversine_km;
-use crate::physics::{effective_skyglow_radiance_nw, AeroPhysicsEngine, SimulationParams};
+use crate::physics::{
+    default_synoptic_nodes_for_region, effective_skyglow_radiance_nw, AeroPhysicsEngine,
+    SeasonPreset, SimulationParams,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::f64::consts::TAU;
@@ -478,4 +484,324 @@ fn round6(v: f64) -> f64 {
 
 fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CorridorLightsOutInterventionRow {
+    pub region_code: String,
+    pub region_label: String,
+    pub doy: f64,
+    pub sim_hours: f64,
+    pub lights_out_curfew_pct: f64,
+    pub peak_viirs_nw_cm2_sr: f64,
+    pub effective_viirs_nw_cm2_sr: f64,
+    pub baseline_urban_strikes: u32,
+    pub intervened_urban_strikes: u32,
+    pub avoided_urban_strikes: u32,
+    pub avoided_urban_strikes_pct: f64,
+    pub baseline_bat_contacts: u32,
+    pub intervened_bat_contacts: u32,
+    pub avoided_bat_contacts: u32,
+    pub avoided_bat_contacts_pct: f64,
+    pub skyglow_entrained_baseline: usize,
+    pub skyglow_entrained_intervened: usize,
+    pub fallout_stopover_birds: usize,
+    pub radar_mtr_birds_km_hr: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultiCorridorLightsOutSummary {
+    pub schema_version: String,
+    pub doy: f64,
+    pub sim_hours: f64,
+    pub lights_out_curfew_pct: f64,
+    pub corridor_count: usize,
+    pub total_baseline_urban_strikes: u64,
+    pub total_intervened_urban_strikes: u64,
+    pub total_avoided_urban_strikes: u64,
+    pub aggregate_avoided_urban_strikes_pct: f64,
+    pub total_baseline_bat_contacts: u64,
+    pub total_intervened_bat_contacts: u64,
+    pub total_avoided_bat_contacts: u64,
+    pub aggregate_avoided_bat_contacts_pct: f64,
+    pub corridors: Vec<CorridorLightsOutInterventionRow>,
+}
+
+/// Evaluates paired unmitigated (`0%` Lights-Out) vs. intervention (`lights_out_curfew_pct`)
+/// migration mortality across all 5 global flyway corridors under identical meteorological forcing.
+pub fn evaluate_multi_corridor_lights_out_summary(
+    hours: f64,
+    doy: f64,
+    lights_out_curfew_pct: f64,
+) -> MultiCorridorLightsOutSummary {
+    let clamped_hours = hours.clamp(1.0, 240.0);
+    let clamped_doy = doy.clamp(1.0, 365.0);
+    let clamped_curfew = lights_out_curfew_pct.clamp(0.0, 100.0);
+    let season = SeasonPreset::from_doy(clamped_doy);
+    let dt_hr = 0.5_f64;
+    let steps = ((clamped_hours / dt_hr).round() as usize).max(1);
+
+    let mut corridors = Vec::with_capacity(FlywayRegion::ALL.len());
+    let mut total_base_urban = 0u64;
+    let mut total_int_urban = 0u64;
+    let mut total_base_bat = 0u64;
+    let mut total_int_bat = 0u64;
+
+    for region in FlywayRegion::ALL {
+        let turbines = seed_wind_turbines_for_region(region);
+        let milkweed = seed_milkweed_patches_for_region(region);
+        let observations = baseline_observations_for_region(region);
+        let weather = default_synoptic_nodes_for_region(region, Cmip6Scenario::BaselineHistorical);
+        let (ta, tb) = region.default_transect();
+
+        let mut base_engine = AeroPhysicsEngine::new();
+        base_engine.weather_nodes = weather.clone();
+        base_engine.reseed_agents(region, season);
+        let base_params = SimulationParams {
+            region,
+            season,
+            day_of_year: clamped_doy,
+            advance_annual_calendar: true,
+            cmip6_scenario: Cmip6Scenario::BaselineHistorical,
+            lights_out_curfew_pct: 0.0,
+            turbine_cut_in_mps: 3.5,
+            transect_start: ta,
+            transect_end: tb,
+            ..SimulationParams::default()
+        };
+
+        let mut int_engine = AeroPhysicsEngine::new();
+        int_engine.weather_nodes = weather;
+        int_engine.reseed_agents(region, season);
+        let int_params = SimulationParams {
+            lights_out_curfew_pct: clamped_curfew,
+            turbine_cut_in_mps: 5.5,
+            ..base_params.clone()
+        };
+
+        for _ in 0..steps {
+            base_engine.step(dt_hr, &base_params, &turbines, &milkweed, &observations);
+            int_engine.step(dt_hr, &int_params, &turbines, &milkweed, &observations);
+        }
+
+        let peak_viirs = skyglow_domes_for_region(region)
+            .iter()
+            .map(|d| d.peak_radiance_nw_cm2_sr)
+            .fold(0.0_f64, f64::max);
+        let eff_viirs = effective_skyglow_radiance_nw(
+            peak_viirs,
+            1.0,
+            true,
+            clamped_curfew,
+            int_params.skyglow_intensity_mult,
+        );
+
+        let base_urban = base_engine
+            .metrics
+            .cumulative_urban_strikes
+            .max(int_engine.metrics.baseline_unmitigated_strikes);
+        let int_urban = int_engine.metrics.cumulative_urban_strikes;
+        let avoided_urban = base_urban.saturating_sub(int_urban);
+        let avoided_urban_pct = if base_urban > 0 {
+            (avoided_urban as f64 / base_urban as f64) * 100.0
+        } else {
+            int_engine.metrics.avoided_urban_strikes_pct
+        };
+
+        let base_bat = base_engine
+            .metrics
+            .cumulative_bat_rotor_contacts
+            .max(int_engine.metrics.baseline_uncurtailed_contacts);
+        let int_bat = int_engine.metrics.cumulative_bat_rotor_contacts;
+        let avoided_bat = base_bat.saturating_sub(int_bat);
+        let avoided_bat_pct = if base_bat > 0 {
+            (avoided_bat as f64 / base_bat as f64) * 100.0
+        } else {
+            int_engine.metrics.avoided_bat_contacts_pct
+        };
+
+        total_base_urban += base_urban as u64;
+        total_int_urban += int_urban as u64;
+        total_base_bat += base_bat as u64;
+        total_int_bat += int_bat as u64;
+
+        corridors.push(CorridorLightsOutInterventionRow {
+            region_code: region.code().to_string(),
+            region_label: region.label().to_string(),
+            doy: round1(clamped_doy),
+            sim_hours: round1(clamped_hours),
+            lights_out_curfew_pct: round1(clamped_curfew),
+            peak_viirs_nw_cm2_sr: round1(peak_viirs),
+            effective_viirs_nw_cm2_sr: round1(eff_viirs),
+            baseline_urban_strikes: base_urban,
+            intervened_urban_strikes: int_urban,
+            avoided_urban_strikes: avoided_urban,
+            avoided_urban_strikes_pct: round1(avoided_urban_pct),
+            baseline_bat_contacts: base_bat,
+            intervened_bat_contacts: int_bat,
+            avoided_bat_contacts: avoided_bat,
+            avoided_bat_contacts_pct: round1(avoided_bat_pct),
+            skyglow_entrained_baseline: base_engine.metrics.skyglow_entrained_birds,
+            skyglow_entrained_intervened: int_engine.metrics.skyglow_entrained_birds,
+            fallout_stopover_birds: int_engine.metrics.fallout_stopover_birds,
+            radar_mtr_birds_km_hr: round1(int_engine.metrics.radar_mtr_birds_km_hr),
+        });
+    }
+
+    let total_avoided_urban = total_base_urban.saturating_sub(total_int_urban);
+    let agg_urban_pct = if total_base_urban > 0 {
+        (total_avoided_urban as f64 / total_base_urban as f64) * 100.0
+    } else {
+        0.0
+    };
+    let total_avoided_bat = total_base_bat.saturating_sub(total_int_bat);
+    let agg_bat_pct = if total_base_bat > 0 {
+        (total_avoided_bat as f64 / total_base_bat as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    MultiCorridorLightsOutSummary {
+        schema_version: "aeroflyway_multi_corridor_lights_out_v1".to_string(),
+        doy: round1(clamped_doy),
+        sim_hours: round1(clamped_hours),
+        lights_out_curfew_pct: round1(clamped_curfew),
+        corridor_count: corridors.len(),
+        total_baseline_urban_strikes: total_base_urban,
+        total_intervened_urban_strikes: total_int_urban,
+        total_avoided_urban_strikes: total_avoided_urban,
+        aggregate_avoided_urban_strikes_pct: round1(agg_urban_pct),
+        total_baseline_bat_contacts: total_base_bat,
+        total_intervened_bat_contacts: total_int_bat,
+        total_avoided_bat_contacts: total_avoided_bat,
+        aggregate_avoided_bat_contacts_pct: round1(agg_bat_pct),
+        corridors,
+    }
+}
+
+/// Formats a [`MultiCorridorLightsOutSummary`] as an RFC 4180 CSV table (5 corridor rows + aggregate row).
+pub fn format_multi_corridor_lights_out_csv(summary: &MultiCorridorLightsOutSummary) -> String {
+    let mut out = String::from(
+        "region_code,region_label,doy,sim_hours,lights_out_curfew_pct,peak_viirs_nw_cm2_sr,effective_viirs_nw_cm2_sr,baseline_urban_strikes,intervened_urban_strikes,avoided_urban_strikes,avoided_urban_strikes_pct,baseline_bat_contacts,intervened_bat_contacts,avoided_bat_contacts,avoided_bat_contacts_pct,skyglow_entrained_baseline,skyglow_entrained_intervened,fallout_stopover_birds,radar_mtr_birds_km_hr\n",
+    );
+    for r in &summary.corridors {
+        out.push_str(&format!(
+            "{},{},{:.1},{:.1},{:.1},{:.1},{:.1},{},{},{},{:.1},{},{},{},{:.1},{},{},{},{:.1}\n",
+            csv_escape(&r.region_code),
+            csv_escape(&r.region_label),
+            r.doy,
+            r.sim_hours,
+            r.lights_out_curfew_pct,
+            r.peak_viirs_nw_cm2_sr,
+            r.effective_viirs_nw_cm2_sr,
+            r.baseline_urban_strikes,
+            r.intervened_urban_strikes,
+            r.avoided_urban_strikes,
+            r.avoided_urban_strikes_pct,
+            r.baseline_bat_contacts,
+            r.intervened_bat_contacts,
+            r.avoided_bat_contacts,
+            r.avoided_bat_contacts_pct,
+            r.skyglow_entrained_baseline,
+            r.skyglow_entrained_intervened,
+            r.fallout_stopover_birds,
+            r.radar_mtr_birds_km_hr,
+        ));
+    }
+    out.push_str(&format!(
+        "ALL_CORRIDORS,Global Five-Corridor Aggregate,{:.1},{:.1},{:.1},0.0,0.0,{},{},{},{:.1},{},{},{},{:.1},0,0,0,0.0\n",
+        summary.doy,
+        summary.sim_hours,
+        summary.lights_out_curfew_pct,
+        summary.total_baseline_urban_strikes,
+        summary.total_intervened_urban_strikes,
+        summary.total_avoided_urban_strikes,
+        summary.aggregate_avoided_urban_strikes_pct,
+        summary.total_baseline_bat_contacts,
+        summary.total_intervened_bat_contacts,
+        summary.total_avoided_bat_contacts,
+        summary.aggregate_avoided_bat_contacts_pct,
+    ));
+    out
+}
+
+/// Evaluates and writes `aeroflyway_multi_corridor_lights_out.json` and `.csv` into `out_dir`.
+pub fn export_multi_corridor_lights_out_summary(
+    out_dir: impl AsRef<Path>,
+    hours: f64,
+    doy: f64,
+    lights_out_curfew_pct: f64,
+) -> Result<(PathBuf, PathBuf, MultiCorridorLightsOutSummary), String> {
+    let dir = out_dir.as_ref();
+    fs::create_dir_all(dir).map_err(|e| format!("Create export dir failed: {e}"))?;
+    let summary = evaluate_multi_corridor_lights_out_summary(hours, doy, lights_out_curfew_pct);
+    let json_path = dir.join("aeroflyway_multi_corridor_lights_out.json");
+    let csv_path = dir.join("aeroflyway_multi_corridor_lights_out.csv");
+
+    let json_txt = serde_json::to_string_pretty(&summary)
+        .map_err(|e| format!("Multi-corridor JSON serialize error: {e}"))?;
+    fs::write(&json_path, json_txt).map_err(|e| format!("Write multi-corridor JSON failed: {e}"))?;
+    let csv_txt = format_multi_corridor_lights_out_csv(&summary);
+    fs::write(&csv_path, csv_txt).map_err(|e| format!("Write multi-corridor CSV failed: {e}"))?;
+
+    Ok((json_path, csv_path, summary))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_corridor_lights_out_summary_covers_all_five_flyways_and_reduces_skyglow() {
+        let summary = evaluate_multi_corridor_lights_out_summary(12.0, 272.0, 85.0);
+        assert_eq!(summary.schema_version, "aeroflyway_multi_corridor_lights_out_v1");
+        assert_eq!(summary.corridor_count, 5);
+        assert_eq!(summary.corridors.len(), 5);
+        for row in &summary.corridors {
+            assert!(row.peak_viirs_nw_cm2_sr > 0.0);
+            assert!(row.effective_viirs_nw_cm2_sr < row.peak_viirs_nw_cm2_sr);
+            assert!(row.intervened_urban_strikes <= row.baseline_urban_strikes);
+            assert!(row.intervened_bat_contacts <= row.baseline_bat_contacts);
+        }
+        assert!(summary.total_intervened_urban_strikes <= summary.total_baseline_urban_strikes);
+    }
+
+    #[test]
+    fn multi_corridor_csv_and_json_export_roundtrip_is_well_formed() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aeroflyway_multi_corridor_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let (json_path, csv_path, summary) =
+            export_multi_corridor_lights_out_summary(&tmp_dir, 8.0, 272.0, 80.0)
+                .expect("multi-corridor export succeeds");
+        assert!(json_path.exists());
+        assert!(csv_path.exists());
+
+        let json_txt = fs::read_to_string(&json_path).expect("read json");
+        let parsed: MultiCorridorLightsOutSummary =
+            serde_json::from_str(&json_txt).expect("parse summary json");
+        assert_eq!(parsed.corridor_count, 5);
+        assert_eq!(parsed.corridors.len(), summary.corridors.len());
+
+        let csv_txt = fs::read_to_string(&csv_path).expect("read csv");
+        let lines: Vec<&str> = csv_txt.lines().collect();
+        assert_eq!(lines.len(), 7, "header + 5 corridors + ALL_CORRIDORS aggregate");
+        assert!(lines[0].starts_with("region_code,region_label,doy,sim_hours"));
+        assert!(lines[6].starts_with("ALL_CORRIDORS,"));
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn multi_corridor_higher_curfew_monotonically_lowers_effective_skyglow() {
+        let s0 = evaluate_multi_corridor_lights_out_summary(6.0, 272.0, 0.0);
+        let s85 = evaluate_multi_corridor_lights_out_summary(6.0, 272.0, 85.0);
+        for (r0, r85) in s0.corridors.iter().zip(s85.corridors.iter()) {
+            assert_eq!(r0.region_code, r85.region_code);
+            assert!(r85.effective_viirs_nw_cm2_sr < r0.effective_viirs_nw_cm2_sr);
+        }
+        assert!(s85.total_intervened_urban_strikes <= s0.total_intervened_urban_strikes);
+    }
 }

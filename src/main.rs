@@ -14,6 +14,7 @@
 // along with this program.  If not, see <https://gnu.org>.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![deny(unsafe_code)]
 
 //! AeroFlyway v0.6.0 — Native Rust `wgpu` + WGSL 100k-Agent Multi-Flyway GIS Workstation:
 //! - Startup Campaign Hub (`AppStage::StartupHub`) + Native Persistent Menu Bar (`egui::menu::bar`)
@@ -42,7 +43,10 @@ use eframe::egui::{
     TextureHandle, TextureOptions, Vec2,
 };
 use eframe::egui_wgpu;
-use aeroflyway::export::{export_corridor_csv_bundle, export_corridor_geojson_to_path};
+use aeroflyway::export::{
+    export_corridor_csv_bundle, export_corridor_geojson_to_path,
+    export_multi_corridor_lights_out_summary,
+};
 use aeroflyway::gpu_pipeline::{
     pack_gpu_scene_buffers, pack_gpu_uniforms, FlywayGpuResources, GpuReadbackSummary,
     MapGpuSimAndPaintCallback, SharedReadbackHandle, TransectGpuPaintCallback, DEFAULT_GPU_AGENTS,
@@ -81,6 +85,54 @@ enum BottomDockTab {
     RadarVerticalProfile,
     AcousticSpectrogram,
     BatchSweepLab,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaletteAction {
+    OpenStartupHub,
+    OpenWorkbench,
+    SwitchTab(BottomDockTab),
+    ResetCamera,
+    Toggle25D,
+    ToggleHelpModal,
+    SwitchRegion(FlywayRegion),
+    ApplyScenario(ScenarioPreset),
+    ToggleSimulation,
+    StepOneHour,
+    ToggleLightsOut,
+    ResetCounters,
+    SaveCampaign,
+    ExportMultiCorridorSummary,
+    ExportActiveCorridorGeoJson,
+    ExportActiveCorridorCsv,
+}
+
+fn fuzzy_subsequence_score(query: &str, candidate: &str) -> Option<i32> {
+    let q: Vec<char> = query.trim().to_ascii_lowercase().chars().collect();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let cand_lower = candidate.to_ascii_lowercase();
+    if let Some(pos) = cand_lower.find(&q.iter().collect::<String>()) {
+        return Some(200 - pos as i32);
+    }
+    let mut qi = 0usize;
+    let mut score = 0i32;
+    let mut prev_match = false;
+    for ch in cand_lower.chars() {
+        if qi < q.len() && ch == q[qi] {
+            score += if prev_match { 12 } else { 5 };
+            prev_match = true;
+            qi += 1;
+        } else {
+            prev_match = false;
+        }
+    }
+    if qi == q.len() {
+        Some(score)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,6 +313,10 @@ struct AeroFlywayApp {
     active_campaign: CampaignSummary,
     show_help_modal: bool,
     show_about_modal: bool,
+    show_command_palette: bool,
+    command_palette_query: String,
+    command_palette_selected: usize,
+    palette_focus_pending: bool,
     selected_radar_idx: usize,
     vpts_csv_path_input: String,
 
@@ -376,6 +432,10 @@ impl AeroFlywayApp {
             active_campaign,
             show_help_modal: false,
             show_about_modal: false,
+            show_command_palette: false,
+            command_palette_query: String::new(),
+            command_palette_selected: 0,
+            palette_focus_pending: false,
             selected_radar_idx: 0,
             vpts_csv_path_input: String::new(),
             store,
@@ -565,6 +625,278 @@ impl AeroFlywayApp {
         };
     }
 
+    fn export_multi_corridor_summary_to_dir(&mut self) {
+        let dir = if self.export_dir_input.trim().is_empty() {
+            "exports".to_string()
+        } else {
+            self.export_dir_input.trim().to_string()
+        };
+        let curfew = if self.params.lights_out_curfew_pct > 1.0 {
+            self.params.lights_out_curfew_pct
+        } else {
+            85.0
+        };
+        match export_multi_corridor_lights_out_summary(&dir, 24.0, self.params.day_of_year, curfew) {
+            Ok((jp, cp, summary)) => {
+                self.status_line = format!(
+                    "Exported 5-corridor Lights-Out summary ({:.1}% urban strike reduction) -> {} & {}",
+                    summary.aggregate_avoided_urban_strikes_pct,
+                    jp.display(),
+                    cp.display()
+                );
+            }
+            Err(err) => {
+                self.status_line = format!("Multi-corridor summary export error: {err}");
+            }
+        }
+    }
+
+    fn execute_palette_action(&mut self, action: PaletteAction) {
+        match action {
+            PaletteAction::OpenStartupHub => {
+                self.stage = AppStage::StartupHub;
+                self.status_line = "Switched to Startup Campaign Hub".to_string();
+            }
+            PaletteAction::OpenWorkbench => {
+                self.stage = AppStage::Workbench;
+                self.status_line = "Switched to 3D GIS Map Workbench".to_string();
+            }
+            PaletteAction::SwitchTab(tab) => {
+                self.stage = AppStage::Workbench;
+                self.bottom_tab = tab;
+                self.status_line = format!("Switched bottom dock tab -> {:?}", tab);
+            }
+            PaletteAction::ResetCamera => {
+                self.reset_camera();
+            }
+            PaletteAction::Toggle25D => {
+                self.map.toggle_25d();
+                self.status_line = format!("Toggled 2D/2.5D pitch -> {:.0} deg", self.map.pitch_deg);
+            }
+            PaletteAction::ToggleHelpModal => {
+                self.show_help_modal = !self.show_help_modal;
+            }
+            PaletteAction::SwitchRegion(reg) => {
+                self.stage = AppStage::Workbench;
+                self.apply_region_switch(reg);
+            }
+            PaletteAction::ApplyScenario(preset) => {
+                self.stage = AppStage::Workbench;
+                self.apply_scenario_preset(preset);
+            }
+            PaletteAction::ToggleSimulation => {
+                self.running = !self.running;
+                self.status_line = if self.running {
+                    "Simulation resumed.".to_string()
+                } else {
+                    "Simulation paused.".to_string()
+                };
+            }
+            PaletteAction::StepOneHour => {
+                self.engine.step(
+                    1.0,
+                    &self.params,
+                    &self.turbines,
+                    &self.milkweed,
+                    &self.observations,
+                );
+                self.last_frame_sim_dt_hr = 1.0;
+                self.gpu_tick_seed = self.gpu_tick_seed.wrapping_add(1);
+                self.status_line = "Stepped simulation +1.0 hr".to_string();
+            }
+            PaletteAction::ToggleLightsOut => {
+                self.toggle_lights_out_curfew();
+            }
+            PaletteAction::ResetCounters => {
+                self.reset_all_counters();
+                self.status_line = "Reset collision and strike counters".to_string();
+            }
+            PaletteAction::SaveCampaign => {
+                self.save_active_campaign_metadata();
+            }
+            PaletteAction::ExportMultiCorridorSummary => {
+                self.export_multi_corridor_summary_to_dir();
+            }
+            PaletteAction::ExportActiveCorridorGeoJson => {
+                let dir = if self.export_dir_input.trim().is_empty() {
+                    PathBuf::from("exports")
+                } else {
+                    PathBuf::from(self.export_dir_input.trim())
+                };
+                let out_path = dir.join("aeroflyway_corridor.geojson");
+                match export_corridor_geojson_to_path(
+                    &out_path,
+                    &self.engine,
+                    &self.params,
+                    &self.observations,
+                    &self.turbines,
+                    &self.milkweed,
+                    self.current_scale_factor(),
+                ) {
+                    Ok((p, n)) => {
+                        self.status_line = format!("Exported {n} GeoJSON features -> {}", p.display());
+                    }
+                    Err(err) => {
+                        self.status_line = format!("GeoJSON export error: {err}");
+                    }
+                }
+            }
+            PaletteAction::ExportActiveCorridorCsv => {
+                let dir = if self.export_dir_input.trim().is_empty() {
+                    PathBuf::from("exports")
+                } else {
+                    PathBuf::from(self.export_dir_input.trim())
+                };
+                match export_corridor_csv_bundle(
+                    &dir,
+                    &self.engine,
+                    &self.params,
+                    &self.observations,
+                    self.current_scale_factor(),
+                ) {
+                    Ok((hp, _, n)) => {
+                        self.status_line = format!("Exported {n} CSV rows -> {}", hp.display());
+                    }
+                    Err(err) => {
+                        self.status_line = format!("CSV bundle export error: {err}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn palette_entries() -> Vec<(&'static str, &'static str, PaletteAction)> {
+        vec![
+            ("View: Startup Campaign Hub (H)", "Views", PaletteAction::OpenStartupHub),
+            ("View: 3D GIS Map Workbench", "Views", PaletteAction::OpenWorkbench),
+            ("View: Tab 1 - Airspace Cross-Section Transect", "Views", PaletteAction::SwitchTab(BottomDockTab::AirspaceTransect)),
+            ("View: Tab 2 - NEXRAD / Aloft Radar VPTS", "Views", PaletteAction::SwitchTab(BottomDockTab::RadarVerticalProfile)),
+            ("View: Tab 3 - WAV STFT Bioacoustic Inspector", "Views", PaletteAction::SwitchTab(BottomDockTab::AcousticSpectrogram)),
+            ("View: Tab 4 - Multi-Scenario Batch Sweep Lab", "Views", PaletteAction::SwitchTab(BottomDockTab::BatchSweepLab)),
+            ("View: Reset Camera to Corridor 2.5D Default (0 / R)", "Views", PaletteAction::ResetCamera),
+            ("View: Toggle 2D Plan / 2.5D Oblique Pitch", "Views", PaletteAction::Toggle25D),
+            ("View: Shortcuts & Scientific Grounding (F1)", "Views", PaletteAction::ToggleHelpModal),
+            ("Corridor: Pacific Americas (Willamette / Columbia)", "Corridors", PaletteAction::SwitchRegion(FlywayRegion::PacificAmericas)),
+            ("Corridor: Central / Mississippi (Platte River)", "Corridors", PaletteAction::SwitchRegion(FlywayRegion::CentralAmericasPlatte)),
+            ("Corridor: Atlantic Americas (NYC / Cape May)", "Corridors", PaletteAction::SwitchRegion(FlywayRegion::AtlanticAmericas)),
+            ("Corridor: East Atlantic Palearctic (Falsterbo / Gibraltar)", "Corridors", PaletteAction::SwitchRegion(FlywayRegion::EastAtlanticPalearctic)),
+            ("Corridor: East Asian-Australasian (Yellow Sea)", "Corridors", PaletteAction::SwitchRegion(FlywayRegion::EastAsianAustralasian)),
+            ("Preset: Autumn Lights-Out Peak (85% Curfew)", "Presets", PaletteAction::ApplyScenario(ScenarioPreset::AutumnLightsOutPeak)),
+            ("Preset: Megafire Smoke Plume SSP5-8.5", "Presets", PaletteAction::ApplyScenario(ScenarioPreset::MegafireSmokeSsp585)),
+            ("Preset: Spring Fallout Unmitigated", "Presets", PaletteAction::ApplyScenario(ScenarioPreset::SpringFalloutUnmitigated)),
+            ("Simulation: Play / Pause Multi-Taxa Loop (Space)", "Simulation", PaletteAction::ToggleSimulation),
+            ("Simulation: Step +1 Hour", "Simulation", PaletteAction::StepOneHour),
+            ("Simulation: Toggle 85% BirdCast Lights-Out Curfew (L)", "Simulation", PaletteAction::ToggleLightsOut),
+            ("Simulation: Reset Collision & Strike Counters", "Simulation", PaletteAction::ResetCounters),
+            ("Simulation: Save Campaign Metadata to SQLite (Ctrl+S)", "Simulation", PaletteAction::SaveCampaign),
+            ("Export: Multi-Corridor Lights-Out Summary (JSON + CSV)", "Exports", PaletteAction::ExportMultiCorridorSummary),
+            ("Export: Active Corridor RFC 7946 GeoJSON", "Exports", PaletteAction::ExportActiveCorridorGeoJson),
+            ("Export: Active Corridor CSV Bundle", "Exports", PaletteAction::ExportActiveCorridorCsv),
+        ]
+    }
+
+    fn filtered_palette_entries(&self) -> Vec<(&'static str, &'static str, PaletteAction)> {
+        let q = self.command_palette_query.trim();
+        let all = Self::palette_entries();
+        if q.is_empty() {
+            return all;
+        }
+        let mut scored: Vec<(i32, (&'static str, &'static str, PaletteAction))> = all
+            .into_iter()
+            .filter_map(|item| {
+                let hay = format!("{} {}", item.1, item.0);
+                fuzzy_subsequence_score(q, &hay).map(|s| (s, item))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1 .0.cmp(b.1 .0)));
+        scored.into_iter().map(|(_, item)| item).collect()
+    }
+
+    fn render_command_palette_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_command_palette {
+            return;
+        }
+        let filtered = self.filtered_palette_entries();
+        if !filtered.is_empty() {
+            self.command_palette_selected = self.command_palette_selected.min(filtered.len() - 1);
+        } else {
+            self.command_palette_selected = 0;
+        }
+
+        let (up_pressed, down_pressed, enter_pressed) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+        if up_pressed && !filtered.is_empty() {
+            self.command_palette_selected = if self.command_palette_selected == 0 {
+                filtered.len() - 1
+            } else {
+                self.command_palette_selected - 1
+            };
+        }
+        if down_pressed && !filtered.is_empty() {
+            self.command_palette_selected = (self.command_palette_selected + 1) % filtered.len();
+        }
+        if enter_pressed {
+            if let Some((_, _, act)) = filtered.get(self.command_palette_selected).copied() {
+                self.show_command_palette = false;
+                self.execute_palette_action(act);
+                return;
+            }
+        }
+
+        let mut open = self.show_command_palette;
+        let mut clicked_action: Option<PaletteAction> = None;
+        egui::Window::new("Command Palette (Ctrl+K)")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 64.0))
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                let edit_resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.command_palette_query)
+                        .id(egui::Id::new("aeroflyway_cmd_palette_input"))
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Type to fuzzy-filter views, corridors, simulation, or exports..."),
+                );
+                if self.palette_focus_pending {
+                    edit_resp.request_focus();
+                    self.palette_focus_pending = false;
+                }
+                if edit_resp.changed() {
+                    self.command_palette_selected = 0;
+                }
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    if filtered.is_empty() {
+                        ui.small("No matching commands. Press Esc to close.");
+                    } else {
+                        for (idx, (label, group, act)) in filtered.iter().enumerate() {
+                            let selected = idx == self.command_palette_selected;
+                            let row_text = format!("[{group}] {label}");
+                            if ui.selectable_label(selected, row_text).clicked() {
+                                clicked_action = Some(*act);
+                            }
+                        }
+                    }
+                });
+                ui.separator();
+                ui.small("Up/Down: Navigate  |  Enter: Execute  |  Esc: Close");
+            });
+
+        if !open {
+            self.show_command_palette = false;
+        }
+        if let Some(act) = clicked_action {
+            self.show_command_palette = false;
+            self.execute_palette_action(act);
+        }
+    }
+
     fn apply_scenario_preset(&mut self, preset: ScenarioPreset) {
         match preset {
             ScenarioPreset::AutumnLightsOutPeak => {
@@ -629,14 +961,28 @@ impl AeroFlywayApp {
 
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
         let wants_kb = ctx.wants_keyboard_input();
-        let (esc_pressed, save_pressed) = ctx.input(|i| {
+        let (esc_pressed, save_pressed, ctrl_k_pressed) = ctx.input(|i| {
+            let cmd = i.modifiers.command || i.modifiers.ctrl;
             (
                 i.key_pressed(egui::Key::Escape),
-                (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::S),
+                cmd && i.key_pressed(egui::Key::S),
+                cmd && i.key_pressed(egui::Key::K),
             )
         });
+        if ctrl_k_pressed {
+            if self.show_command_palette {
+                self.show_command_palette = false;
+            } else if !wants_kb {
+                self.show_command_palette = true;
+                self.command_palette_query.clear();
+                self.command_palette_selected = 0;
+                self.palette_focus_pending = true;
+            }
+        }
         if esc_pressed {
-            if self.show_about_modal {
+            if self.show_command_palette {
+                self.show_command_palette = false;
+            } else if self.show_about_modal {
                 self.show_about_modal = false;
             } else if self.show_help_modal {
                 self.show_help_modal = false;
@@ -648,7 +994,7 @@ impl AeroFlywayApp {
         if save_pressed {
             self.save_active_campaign_metadata();
         }
-        if wants_kb {
+        if wants_kb || self.show_command_palette {
             return;
         }
         let (
@@ -1050,6 +1396,13 @@ impl AeroFlywayApp {
                         }
                         ui.close_menu();
                     }
+                    if ui
+                        .button("Export Multi-Corridor Lights-Out Summary (JSON + CSV)")
+                        .clicked()
+                    {
+                        self.export_multi_corridor_summary_to_dir();
+                        ui.close_menu();
+                    }
                     ui.separator();
                     if ui.button("Reset Collision & Strike Counters").clicked() {
                         self.reset_all_counters();
@@ -1436,8 +1789,9 @@ impl AeroFlywayApp {
                 ui.monospace("  1 - 4 : Switch bottom dock tabs (1 Transect, 2 VPTS, 3 WAV, 4 Batch)");
                 ui.monospace("  T / M : Toggle Draw A-B Transect (T) or Plant Host Patch (M) tool");
                 ui.monospace("  L     : Toggle 85% BirdCast Lights-Out curfew vs 0% unmitigated");
+                ui.monospace("  Ctrl+K: Open fuzzy command palette (views, corridors, sim, exports)");
                 ui.monospace("  Ctrl+S: Save active campaign metadata to SQLite");
-                ui.monospace("  Esc   : Dismiss About/Help modal or reset map tool to Pan & Inspect");
+                ui.monospace("  Esc   : Dismiss palette/modal or reset map tool to Pan & Inspect");
                 ui.monospace("  F1    : Show / hide this reference window");
                 ui.separator();
                 ui.label(RichText::new("Empirical Data & Model Grounding").strong());
@@ -3972,6 +4326,7 @@ impl AeroFlywayApp {
         self.render_native_menu_bar(ctx);
         self.render_help_modal(ctx);
         self.render_about_modal(ctx);
+        self.render_command_palette_modal(ctx);
 
         match self.stage {
             AppStage::StartupHub => {
@@ -4442,6 +4797,7 @@ fn run_headless_screenshot(out_path: &std::path::Path, view: u8) -> Result<(), S
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn attach_parent_console_if_cli() {
     if std::env::args_os().len() > 1 {
         // SAFETY: Win32 AttachConsole(ATTACH_PARENT_PROCESS) binds stdout/stderr to an
@@ -4852,6 +5208,161 @@ mod tests {
         assert_eq!(mesh.vertices.len(), 25, "4x4 tile grid requires 5x5=25 vertices");
         assert_eq!(mesh.indices.len(), 96, "4x4 tile grid requires 32 triangles (96 indices)");
 
+        drop(app);
+        cleanup_db(&db_path);
+    }
+
+    #[test]
+    fn fuzzy_subsequence_score_ranks_substring_above_sparse_subsequence() {
+        let exact = fuzzy_subsequence_score("lights", "Simulation: Toggle 85% BirdCast Lights-Out Curfew")
+            .expect("substring matches");
+        let sparse = fuzzy_subsequence_score("lgt", "Simulation: Toggle 85% BirdCast Lights-Out Curfew")
+            .expect("subsequence matches");
+        assert!(exact > sparse);
+        assert!(fuzzy_subsequence_score("zzzz", "Atlantic Americas").is_none());
+    }
+
+    #[test]
+    fn ctrl_k_command_palette_opens_filters_navigates_executes_and_escapes() {
+        let db_path = temp_db("palette_nav");
+        cleanup_db(&db_path);
+
+        let ctx = egui::Context::default();
+        let mut app = AeroFlywayApp::new_with_wgpu(&ctx, None, db_path.clone(), true);
+        app.running = false;
+
+        let ctrl_k = egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        step_app_with_input(&mut app, &ctx, egui::Modifiers::CTRL, vec![ctrl_k], Vec::new());
+        assert!(app.show_command_palette);
+
+        // Esc dismisses command palette cleanly
+        let esc = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        step_app_with_input(&mut app, &ctx, egui::Modifiers::NONE, vec![esc], Vec::new());
+        assert!(!app.show_command_palette);
+
+        // Re-open, filter for Atlantic, navigate Down/Up, and press Enter to switch corridor
+        let ctrl_k2 = egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        step_app_with_input(&mut app, &ctx, egui::Modifiers::CTRL, vec![ctrl_k2], Vec::new());
+        assert!(app.show_command_palette);
+        app.command_palette_query = "Atlantic".to_string();
+        let matches = app.filtered_palette_entries();
+        assert!(!matches.is_empty());
+
+        let down = egui::Event::Key {
+            key: egui::Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let up = egui::Event::Key {
+            key: egui::Key::ArrowUp,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        step_app_with_input(&mut app, &ctx, egui::Modifiers::NONE, vec![down, up], Vec::new());
+        assert_eq!(app.command_palette_selected, 0);
+
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        step_app_with_input(&mut app, &ctx, egui::Modifiers::NONE, vec![enter], Vec::new());
+        assert!(!app.show_command_palette);
+        assert_eq!(app.params.region, FlywayRegion::AtlanticAmericas);
+
+        drop(app);
+        cleanup_db(&db_path);
+    }
+
+    #[test]
+    fn ctrl_k_respects_wants_keyboard_input_guard_when_text_edit_focused() {
+        let db_path = temp_db("palette_guard");
+        cleanup_db(&db_path);
+
+        let ctx = egui::Context::default();
+        let mut app = AeroFlywayApp::new_with_wgpu(&ctx, None, db_path.clone(), true);
+        app.running = false;
+
+        let text_id = egui::Id::new("palette_guard_text_input");
+        let mut buf = String::new();
+        let _ = ctx.run(egui::RawInput::default(), |c| {
+            egui::CentralPanel::default().show(c, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut buf).id(text_id)).request_focus();
+            });
+        });
+        assert!(ctx.wants_keyboard_input());
+
+        let ctrl_k = egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+                modifiers: egui::Modifiers::CTRL,
+                events: vec![ctrl_k],
+                ..Default::default()
+            },
+            |c| {
+                egui::CentralPanel::default().show(c, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut buf).id(text_id));
+                });
+                app.handle_keyboard_shortcuts(c);
+            },
+        );
+        assert!(!app.show_command_palette, "Ctrl+K must not open while external TextEdit has focus");
+
+        drop(app);
+        cleanup_db(&db_path);
+    }
+
+    #[test]
+    fn palette_export_multi_corridor_action_writes_json_and_csv() {
+        let db_path = temp_db("palette_export");
+        cleanup_db(&db_path);
+        let export_dir = std::env::temp_dir().join(format!(
+            "aeroflyway_palette_export_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&export_dir);
+
+        let ctx = egui::Context::default();
+        let mut app = AeroFlywayApp::new_with_wgpu(&ctx, None, db_path.clone(), true);
+        app.export_dir_input = export_dir.display().to_string();
+        app.execute_palette_action(PaletteAction::ExportMultiCorridorSummary);
+
+        assert!(export_dir.join("aeroflyway_multi_corridor_lights_out.json").exists());
+        assert!(export_dir.join("aeroflyway_multi_corridor_lights_out.csv").exists());
+        assert!(app.status_line.contains("Exported 5-corridor Lights-Out summary"));
+
+        let _ = std::fs::remove_dir_all(&export_dir);
         drop(app);
         cleanup_db(&db_path);
     }
